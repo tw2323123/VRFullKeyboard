@@ -12,6 +12,8 @@ The first launch builds only the native Control Center. It requires Visual Studi
 
 The developer Control Center can launch previews, build the core, create the prebuilt share package, inspect logs, and manage build outputs.
 
+If the project folder is moved or renamed, the Control Center automatically detects a stale CMake cache that points to the old source path, clears only the generated `build` directory, and configures the project again.
+
 ## Prebuilt share version
 
 Use **建立分享版** in the developer Control Center. It creates:

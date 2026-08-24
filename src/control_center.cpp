@@ -346,8 +346,56 @@ int RunProcessCapture(const fs::path& exe, const std::vector<std::wstring>& args
     return (int)exitCode;
 }
 
+std::wstring NormalizePathForCompare(const fs::path& path) {
+    std::error_code ec;
+    fs::path normalized = fs::weakly_canonical(path, ec);
+    if (ec) {
+        ec.clear();
+        normalized = fs::absolute(path, ec);
+        if (ec) normalized = path;
+    }
+    std::wstring text = normalized.lexically_normal().wstring();
+    std::replace(text.begin(), text.end(), L'/', L'\\');
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) { return (wchar_t)towlower(ch); });
+    while (text.size() > 3 && (text.back() == L'\\' || text.back() == L'/')) text.pop_back();
+    return text;
+}
+
+bool RemoveStaleBuildCacheIfNeeded() {
+    const fs::path buildDir = g_root / L"build";
+    const fs::path cachePath = buildDir / L"CMakeCache.txt";
+    if (!fs::exists(cachePath)) return true;
+
+    const std::wstring cache = ReadTextFile(cachePath);
+    const std::wstring key = L"CMAKE_HOME_DIRECTORY:INTERNAL=";
+    const size_t pos = cache.find(key);
+    if (pos == std::wstring::npos) return true;
+
+    const size_t valueStart = pos + key.size();
+    size_t valueEnd = cache.find_first_of(L"\r\n", valueStart);
+    if (valueEnd == std::wstring::npos) valueEnd = cache.size();
+    const std::wstring cachedSource = cache.substr(valueStart, valueEnd - valueStart);
+    if (cachedSource.empty()) return true;
+
+    if (NormalizePathForCompare(fs::path(cachedSource)) == NormalizePathForCompare(g_root)) return true;
+
+    PostLog(L"[自動修復] 偵測到 build/CMakeCache.txt 屬於其他專案路徑：\r\n");
+    PostLog(L"  舊路徑：" + cachedSource + L"\r\n");
+    PostLog(L"  目前路徑：" + g_root.wstring() + L"\r\n");
+    PostLog(L"[自動修復] 正在清除舊建置快取並重新設定...\r\n");
+
+    std::error_code ec;
+    fs::remove_all(buildDir, ec);
+    if (ec) {
+        PostLog(L"[錯誤] 無法清除舊 build 資料夾，請關閉可能正在使用它的程式後再試一次。\r\n");
+        return false;
+    }
+    return true;
+}
+
 bool ConfigureProject(const fs::path& cmake) {
     PostLog(L"\r\n[1/2] 設定 CMake 專案...\r\n");
+    if (!RemoveStaleBuildCacheIfNeeded()) return false;
     return RunProcessCapture(cmake, {
         L"-S", g_root.wstring(),
         L"-B", (g_root / L"build").wstring(),
