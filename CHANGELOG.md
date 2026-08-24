@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.9.5
+
+- 修正編輯預覽中文字按鈕在部分 DPI / 微軟正黑體下視覺基線偏低的問題。
+- 編輯器按鈕文字改為獨立的向上微調對齊，不影響 VR 鍵盤本體鍵帽。
+- 保留 V3.9.3 的裁切修正、UI 間距解耦與自動儲存 I/O 優化。
+
+## 3.9.3
+- Fixed editor sidebar controls being clipped near the bottom of scrollable pages.
+- Removed the obsolete "防裁切版" development label.
+- Decoupled editor spacing from keyboard key-gap settings.
+- Added explicit shortcut editor row sizing and cell padding for reliable text-field layout.
+- Added bottom scroll breathing room for Appearance and Shortcut pages.
+- Reduced unnecessary INI writes by deferring editor auto-save until the active control is released.
+
 ## 3.9.2
 - 建置前會檢查 `build/CMakeCache.txt` 綁定的 Source 路徑；若專案曾搬家、改名或由舊版資料夾複製而造成路徑不一致，控制中心會自動清除舊快取並重新 Configure。
 - 分享版啟動後約 1.6 秒會在背景檢查 GitHub Latest Release，不主動跳出視窗。
@@ -61,3 +75,9 @@
 - Decoupled Control Center bootstrap build from OpenVR/ImGui fetching.
 - Fixed bootstrap compiler warnings.
 - Clarified source/developer build versus prebuilt share package behavior.
+
+
+## 3.9.5
+- Replaced editor full-width button labels with custom vertically-centered drawing.
+- Removes dependency on ImGui button baseline metrics for Traditional Chinese labels.
+- Keeps normal hover, active, click, border and rounded-corner behavior.

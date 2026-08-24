@@ -886,6 +886,52 @@ bool SelectedButton(const char* label, bool selected, ImVec2 size) {
     return clicked;
 }
 
+// Editor-only button renderer.  Traditional Chinese glyphs in Microsoft JhengHei
+// have a visual baseline that sits lower than ImGui's nominal font metrics.
+// Drawing the label ourselves lets us center the visible text independently of
+// ImGui::Button's baseline calculation while retaining normal ImGui interaction.
+bool EditorCenteredButton(const char* label, ImVec2 size, float visualYOffset = -3.5f) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (size.x < 0.0f) size.x = (std::max)(1.0f, avail.x + size.x + 1.0f);
+    if (size.y <= 0.0f) size.y = ImGui::GetFrameHeight();
+
+    ImGui::PushID(label);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##editor_centered_button", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImU32 bg = ImGui::GetColorU32(active ? ImGuiCol_ButtonActive :
+                                       hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
+    const ImU32 border = ImGui::GetColorU32(ImGuiCol_Border);
+    const ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + size.x, p0.y + size.y);
+    dl->AddRectFilled(p0, p1, bg, style.FrameRounding);
+    if (style.FrameBorderSize > 0.0f)
+        dl->AddRect(p0, p1, border, style.FrameRounding, 0, style.FrameBorderSize);
+
+    const ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, true);
+    const ImVec2 textPos(
+        p0.x + (size.x - textSize.x) * 0.5f,
+        p0.y + (size.y - textSize.y) * 0.5f + visualYOffset);
+    dl->AddText(textPos, textColor, label);
+    ImGui::PopID();
+    return clicked;
+}
+
+bool EditorCenteredSelectedButton(const char* label, bool selected, ImVec2 size) {
+    if (selected) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.48f, 0.78f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.56f, 0.90f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.40f, 0.68f, 1.0f));
+    }
+    const bool clicked = EditorCenteredButton(label, size);
+    if (selected) ImGui::PopStyleColor(3);
+    return clicked;
+}
+
 float KeyboardScale() {
     return std::clamp(g_ui.keyboardScale, 0.55f, 1.35f);
 }
@@ -2245,8 +2291,6 @@ void FitKeyboardToArea(const ImVec2& area) {
 
 void DrawEditorSidebar() {
     ImGui::Text("編輯預覽 V%s", VRFK_VERSION_STRING);
-    ImGui::SameLine();
-    ImGui::TextDisabled("分頁設定｜防裁切版");
     ImGui::Separator();
 
     bool changed = false;
@@ -2259,8 +2303,13 @@ void DrawEditorSidebar() {
         ImGui::PopTextWrapPos();
     };
 
-    constexpr float footerReserve = 112.0f;
+    // The editor sidebar must not inherit keyboard key spacing.  Keeping a
+    // dedicated editor spacing prevents large key-gap settings from squeezing
+    // the footer or clipping the last row of controls.
+    const float editorSpacing = 8.0f;
+    const float footerReserve = ImGui::GetFrameHeight() * 3.0f + editorSpacing * 5.0f + 18.0f;
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(editorSpacing, editorSpacing));
     ImGui::BeginChild("editor_tab_content", ImVec2(0.0f, -footerReserve), ImGuiChildFlags_None,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
@@ -2276,7 +2325,7 @@ void DrawEditorSidebar() {
             changed |= ImGui::SliderFloat("整體縮放", &g_ui.keyboardScale, 0.55f, 1.35f, "%.2fx");
             changed |= ImGui::SliderFloat("X 位置", &g_ui.keyboardOffsetX, -420.0f, 420.0f, "%.0f px");
             changed |= ImGui::SliderFloat("Y 位置", &g_ui.keyboardOffsetY, -180.0f, 260.0f, "%.0f px");
-            if (ImGui::Button("一鍵適應畫面", ImVec2(-1.0f, 36.0f))) FitKeyboardToArea(g_previewKeyboardArea);
+            if (EditorCenteredButton("一鍵適應畫面", ImVec2(-1.0f, 36.0f))) FitKeyboardToArea(g_previewKeyboardArea);
 
             ImGui::SeparatorText("鍵帽");
             changed |= ImGui::SliderFloat("鍵帽高度", &g_ui.keyHeight, 58.0f, 82.0f, "%.0f px");
@@ -2318,7 +2367,7 @@ void DrawEditorSidebar() {
             changed |= ImGui::ColorEdit3("綠區", g_ui.zoneGreen.data(), colorFlags);
             changed |= ImGui::ColorEdit3("藍區", g_ui.zoneBlue.data(), colorFlags);
             changed |= ImGui::ColorEdit3("紫區", g_ui.zonePurple.data(), colorFlags);
-            if (ImGui::Button("恢復預設彩虹外觀", ImVec2(-1.0f, 36.0f))) {
+            if (EditorCenteredButton("恢復預設彩虹外觀", ImVec2(-1.0f, 36.0f))) {
                 ResetAppearanceSettings();
                 changed = true;
             }
@@ -2360,7 +2409,7 @@ void DrawEditorSidebar() {
             for (size_t b = 0; b < g_shortcutBanks.size(); ++b) {
                 ImGui::PushID(static_cast<int>(2000 + b));
                 const char* name = g_shortcutBanks[b].name[0] ? g_shortcutBanks[b].name : "未命名頁";
-                if (SelectedButton(name, g_shortcutBankIndex == b, ImVec2(112, 36))) {
+                if (EditorCenteredSelectedButton(name, g_shortcutBankIndex == b, ImVec2(112, 36))) {
                     g_shortcutBankIndex = b;
                     changed = true;
                 }
@@ -2382,9 +2431,14 @@ void DrawEditorSidebar() {
             }
 
             ImGui::SeparatorText("8 顆按鈕");
-            if (ImGui::BeginTable("shortcut_editor_grid", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
+            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.0f, 7.0f));
+            if (ImGui::BeginTable("shortcut_editor_grid", 2,
+                                  ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV |
+                                  ImGuiTableFlags_PadOuterX)) {
+                const float shortcutRowMinHeight = ImGui::GetTextLineHeightWithSpacing() * 2.0f +
+                                                   ImGui::GetFrameHeight() * 2.0f + 12.0f;
                 for (size_t i = 0; i < bank.slots.size(); ++i) {
-                    if ((i % 2) == 0) ImGui::TableNextRow();
+                    if ((i % 2) == 0) ImGui::TableNextRow(ImGuiTableRowFlags_None, shortcutRowMinHeight);
                     ImGui::TableSetColumnIndex(static_cast<int>(i % 2));
                     ImGui::PushID(static_cast<int>(i));
                     ImGui::Text("#%d", static_cast<int>(i + 1));
@@ -2399,7 +2453,8 @@ void DrawEditorSidebar() {
                 }
                 ImGui::EndTable();
             }
-            if (ImGui::Button("還原目前快捷頁", ImVec2(-1.0f, 34.0f))) {
+            ImGui::PopStyleVar();
+            if (EditorCenteredButton("還原目前快捷頁", ImVec2(-1.0f, 34.0f))) {
                 g_shortcutBanks[g_shortcutBankIndex] = kDefaultShortcutBanks[g_shortcutBankIndex];
                 changed = true;
             }
@@ -2420,10 +2475,10 @@ void DrawEditorSidebar() {
 
             if (g_previewMode) {
                 ImGui::SeparatorText("桌面模擬");
-                if (SelectedButton("模擬手腕圓點", g_wristStandby, ImVec2(-1.0f, 38.0f))) EnterWristStandby(vr::k_ulOverlayHandleInvalid);
-                if (ImGui::Button("模擬召喚到眼前", ImVec2(-1.0f, 36.0f))) SummonKeyboard(vr::k_ulOverlayHandleInvalid, g_wristStandby);
+                if (EditorCenteredSelectedButton("模擬手腕圓點", g_wristStandby, ImVec2(-1.0f, 38.0f))) EnterWristStandby(vr::k_ulOverlayHandleInvalid);
+                if (EditorCenteredButton("模擬召喚到眼前", ImVec2(-1.0f, 36.0f))) SummonKeyboard(vr::k_ulOverlayHandleInvalid, g_wristStandby);
                 if (!g_returnWorldTransformValid) ImGui::BeginDisabled();
-                if (ImGui::Button("模擬返回原位", ImVec2(-1.0f, 36.0f))) ReturnKeyboard(vr::k_ulOverlayHandleInvalid);
+                if (EditorCenteredButton("模擬返回原位", ImVec2(-1.0f, 36.0f))) ReturnKeyboard(vr::k_ulOverlayHandleInvalid);
                 if (!g_returnWorldTransformValid) ImGui::EndDisabled();
             }
 
@@ -2438,20 +2493,31 @@ void DrawEditorSidebar() {
         }
         ImGui::EndTabBar();
     }
+    // Extra scroll padding keeps the final button/input fully visible instead
+    // of landing exactly on the child clipping boundary.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetFrameHeight() * 0.65f));
     ImGui::EndChild();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
 
     ImGui::Separator();
     const bool autoBefore = g_autoSave;
     ImGui::Checkbox("自動儲存", &g_autoSave);
     if (autoBefore != g_autoSave && g_autoSave) SaveSettings();
-    if (ImGui::Button("立即儲存", ImVec2(-1.0f, 34.0f))) SaveSettings();
-    if (ImGui::Button("全部還原預設", ImVec2(-1.0f, 34.0f))) {
+    if (EditorCenteredButton("立即儲存", ImVec2(-1.0f, 34.0f))) SaveSettings();
+    if (EditorCenteredButton("全部還原預設", ImVec2(-1.0f, 34.0f))) {
         ResetUiSettings();
         SaveSettings();
     }
-    if (changed && g_autoSave) SaveSettings();
+    // Do not rewrite the INI every frame while a slider/input is being dragged.
+    // Queue one save and flush it once the user releases the active control.
+    static bool editorAutoSavePending = false;
+    if (changed && g_autoSave) editorAutoSavePending = true;
+    if (editorAutoSavePending && g_autoSave && !ImGui::IsAnyItemActive()) {
+        SaveSettings();
+        editorAutoSavePending = false;
+    }
 }
+
 
 void DrawWristStandbyContent(vr::VROverlayHandle_t overlay, const ImVec2& areaSize) {
     // In SteamVR the overlay is cropped to a square TEX_H x TEX_H region.
