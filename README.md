@@ -2,7 +2,7 @@
 
 SteamVR virtual full-size keyboard for Windows, with Traditional Chinese / Bopomofo support, Q9/Numpad mode, macros, wrist summon controls, desktop preview, editor preview, and a native Control Center.
 
-Current version: **3.9.0**
+Current version: **3.9.1**
 
 ## Source / developer version
 
