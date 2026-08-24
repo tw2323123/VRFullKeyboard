@@ -15,6 +15,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iterator>
 #include <memory>
@@ -35,6 +36,8 @@ constexpr UINT WM_APP_LOG = WM_APP + 1;
 constexpr UINT WM_APP_TASK_DONE = WM_APP + 2;
 constexpr UINT WM_APP_UPDATE_CHECK_DONE = WM_APP + 3;
 constexpr UINT WM_APP_UPDATE_EXIT = WM_APP + 4;
+constexpr UINT WM_APP_UPDATE_PROGRESS = WM_APP + 5;
+constexpr UINT_PTR TIMER_BACKGROUND_UPDATE = 1;
 
 constexpr int IDC_STATUS = 1001;
 constexpr int IDC_ENV = 1002;
@@ -49,6 +52,7 @@ constexpr int IDC_OPEN_OUTPUT = 1204;
 constexpr int IDC_OPEN_ROOT = 1301;
 constexpr int IDC_SHORTCUT = 1302;
 constexpr int IDC_OPEN_LOG = 1303;
+constexpr int IDC_ROLLBACK_TEST = 1304;
 constexpr int IDC_LOG = 1401;
 constexpr int IDC_LOG_TOGGLE = 1402;
 constexpr int IDC_LOG_CLEAR = 1403;
@@ -63,6 +67,7 @@ struct TaskDone {
 struct UpdateReleaseInfo {
     bool success = false;
     bool updateAvailable = false;
+    bool silent = false;
     std::string tag;
     std::string name;
     std::string notes;
@@ -83,6 +88,7 @@ HFONT g_titleFont = nullptr;
 HFONT g_logFont = nullptr;
 HBRUSH g_logBrush = nullptr;
 std::atomic_bool g_busy{false};
+std::atomic_bool g_updateCheckBusy{false};
 fs::path g_root;
 fs::path g_persistentLogPath;
 bool g_developerMode = false;
@@ -90,6 +96,9 @@ bool g_coreReady = false;
 bool g_cmakeReady = false;
 bool g_gitReady = false;
 bool g_logExpanded = false;
+bool g_updateAvailableHint = false;
+std::wstring g_updateAvailableTag;
+std::wstring g_updateButtonSubtitle = L"檢查 GitHub、驗證並安裝新版";
 std::vector<HWND> g_taskButtons;
 std::vector<HWND> g_allButtons;
 std::unordered_set<HWND> g_hoverButtons;
@@ -252,6 +261,12 @@ void PostLog(const std::wstring& text) {
     if (!g_hwnd || !IsWindow(g_hwnd)) return;
     auto* heapText = new std::wstring(text);
     PostMessageW(g_hwnd, WM_APP_LOG, 0, reinterpret_cast<LPARAM>(heapText));
+}
+
+void PostUpdateProgress(const std::wstring& text) {
+    if (!g_hwnd || !IsWindow(g_hwnd)) return;
+    auto* heapText = new std::wstring(text);
+    PostMessageW(g_hwnd, WM_APP_UPDATE_PROGRESS, 0, reinterpret_cast<LPARAM>(heapText));
 }
 
 void AppendLog(const std::wstring& text) {
@@ -502,7 +517,8 @@ int CompareSemVer(const std::string& lhs, const std::string& rhs) {
 }
 
 bool HttpGetUrl(const std::wstring& url, std::vector<char>& data, DWORD& statusCode,
-                std::wstring& error, bool githubApi = false) {
+                std::wstring& error, bool githubApi = false,
+                const std::function<void(size_t, size_t)>& progress = {}) {
     data.clear();
     statusCode = 0;
     error.clear();
@@ -577,6 +593,15 @@ bool HttpGetUrl(const std::wstring& url, std::vector<char>& data, DWORD& statusC
         return false;
     }
 
+    size_t contentLength = 0;
+    wchar_t contentLengthText[64]{};
+    DWORD contentLengthSize = sizeof(contentLengthText);
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
+                            contentLengthText, &contentLengthSize, WINHTTP_NO_HEADER_INDEX)) {
+        contentLength = static_cast<size_t>(_wcstoui64(contentLengthText, nullptr, 10));
+    }
+    if (progress) progress(0, contentLength);
+
     constexpr size_t kMaxDownload = 256ull * 1024ull * 1024ull;
     while (data.size() < kMaxDownload) {
         DWORD available = 0;
@@ -596,6 +621,7 @@ bool HttpGetUrl(const std::wstring& url, std::vector<char>& data, DWORD& statusC
             break;
         }
         data.resize(old + read);
+        if (progress) progress(data.size(), contentLength);
         if (!read) break;
     }
     if (data.size() >= kMaxDownload && error.empty()) error = L"下載檔案超過安全大小限制。";
@@ -606,10 +632,11 @@ bool HttpGetUrl(const std::wstring& url, std::vector<char>& data, DWORD& statusC
     return error.empty();
 }
 
-bool DownloadToFile(const std::string& urlUtf8, const fs::path& destination, std::wstring& error) {
+bool DownloadToFile(const std::string& urlUtf8, const fs::path& destination, std::wstring& error,
+                    const std::function<void(size_t, size_t)>& progress = {}) {
     std::vector<char> data;
     DWORD status = 0;
-    if (!HttpGetUrl(Utf8ToWide(urlUtf8), data, status, error, false)) return false;
+    if (!HttpGetUrl(Utf8ToWide(urlUtf8), data, status, error, false, progress)) return false;
     std::error_code ec;
     fs::create_directories(destination.parent_path(), ec);
     std::ofstream out(destination, std::ios::binary | std::ios::trunc);
@@ -697,15 +724,32 @@ fs::path UpdateBasePath() {
     return base / L"VRFullKeyboard" / L"updates";
 }
 
+void CleanupStaleUpdateDirectories(const fs::path& keep) {
+    const fs::path base = UpdateBasePath();
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    ec.clear();
+    for (fs::directory_iterator it(base, ec), end; !ec && it != end; it.increment(ec)) {
+        const fs::path p = it->path();
+        if (p == keep || p.filename() == L"backup_previous") continue;
+        if (it->is_directory(ec)) fs::remove_all(p, ec);
+        else fs::remove(p, ec);
+        ec.clear();
+    }
+}
+
 bool LaunchUpdaterProcess(const fs::path& updater, const fs::path& installDir,
-                          const fs::path& stageDir, const fs::path& backupDir) {
+                          const fs::path& stageDir, const fs::path& backupDir,
+                          const std::wstring& fromVersion, const std::wstring& toVersion) {
     const DWORD parentPid = GetCurrentProcessId();
     std::wstring command = Quote(updater.wstring()) +
         L" --install-dir " + Quote(installDir.wstring()) +
         L" --stage-dir " + Quote(stageDir.wstring()) +
         L" --backup-dir " + Quote(backupDir.wstring()) +
         L" --parent-pid " + std::to_wstring(parentPid) +
-        L" --relaunch " + Quote(L"VRFullKeyboardControl.exe");
+        L" --relaunch " + Quote(L"VRFullKeyboardControl.exe") +
+        L" --from-version " + Quote(fromVersion) +
+        L" --to-version " + Quote(toVersion);
     std::vector<wchar_t> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(L'\0');
     STARTUPINFOW si{};
@@ -725,8 +769,9 @@ bool DownloadAndStartUpdate(const UpdateReleaseInfo& info, std::wstring& error) 
     const fs::path zip = updateRoot / L"VRFullKeyboard_Windows_x64.zip";
     const fs::path sha = updateRoot / L"VRFullKeyboard_Windows_x64.sha256";
     const fs::path stage = updateRoot / L"stage";
-    const fs::path backup = updateRoot / L"backup";
+    const fs::path backup = UpdateBasePath() / L"backup_previous";
 
+    CleanupStaleUpdateDirectories(updateRoot);
     std::error_code ec;
     fs::remove_all(updateRoot, ec);
     ec.clear();
@@ -734,9 +779,20 @@ bool DownloadAndStartUpdate(const UpdateReleaseInfo& info, std::wstring& error) 
     if (ec) { error = L"無法建立更新暫存資料夾。"; return false; }
 
     PostLog(L"[更新] 下載 " + Utf8ToWide(info.tag) + L"...\r\n");
-    if (!DownloadToFile(info.zipUrl, zip, error)) return false;
+    PostUpdateProgress(L"下載更新檔 0%");
+    int lastPercent = -5;
+    if (!DownloadToFile(info.zipUrl, zip, error, [&](size_t current, size_t total) {
+            if (total == 0) return;
+            const int percent = static_cast<int>((current * 100ull) / total);
+            if (percent >= lastPercent + 5 || percent == 100) {
+                lastPercent = percent;
+                PostUpdateProgress(L"下載更新檔 " + std::to_wstring(percent) + L"%");
+            }
+        })) return false;
+    PostUpdateProgress(L"下載驗證檔…");
     if (!DownloadToFile(info.shaUrl, sha, error)) return false;
 
+    PostUpdateProgress(L"驗證 SHA256…");
     const std::wstring expected = ExpectedSha256(sha);
     const std::wstring actual = Sha256File(zip);
     if (expected.empty() || actual.empty() || _wcsicmp(expected.c_str(), actual.c_str()) != 0) {
@@ -744,6 +800,7 @@ bool DownloadAndStartUpdate(const UpdateReleaseInfo& info, std::wstring& error) 
         return false;
     }
     PostLog(L"[更新] SHA256 驗證成功。\r\n");
+    PostUpdateProgress(L"解壓更新檔…");
 
     const fs::path powershell = SearchProgram(L"powershell.exe");
     if (powershell.empty()) { error = L"找不到 Windows PowerShell，無法解壓更新。"; return false; }
@@ -777,7 +834,9 @@ bool DownloadAndStartUpdate(const UpdateReleaseInfo& info, std::wstring& error) 
         return false;
     }
 
-    if (!LaunchUpdaterProcess(stage / L"VRFullKeyboardUpdater.exe", g_root, stage, backup)) {
+    PostUpdateProgress(L"準備安裝並重新啟動…");
+    if (!LaunchUpdaterProcess(stage / L"VRFullKeyboardUpdater.exe", g_root, stage, backup,
+                              Utf8ToWide(VRFK_VERSION_STRING), Utf8ToWide(info.tag))) {
         error = L"無法啟動更新器。";
         return false;
     }
@@ -804,16 +863,50 @@ void StartUpdateInstallTask(UpdateReleaseInfo info) {
     }).detach();
 }
 
-void StartUpdateCheckTask() {
-    if (g_busy.exchange(true)) return;
-    if (g_developerMode) SetLogExpanded(true);
-    SetBusy(true);
-    AppendLog(L"\r\n[更新] 正在檢查 GitHub Release...\r\n");
-    std::thread([]() {
+void StartUpdateCheckTask(bool silent = false) {
+    if (g_updateCheckBusy.exchange(true)) return;
+    if (!silent) {
+        if (g_busy.exchange(true)) {
+            g_updateCheckBusy = false;
+            return;
+        }
+        if (g_developerMode) SetLogExpanded(true);
+        SetBusy(true);
+        AppendLog(L"\r\n[更新] 正在檢查 GitHub Release...\r\n");
+        g_updateButtonSubtitle = L"正在檢查 GitHub…";
+        if (HWND update = GetDlgItem(g_hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
+    }
+    std::thread([silent]() {
         UpdateReleaseInfo info = FetchLatestRelease();
+        info.silent = silent;
         auto* heap = new UpdateReleaseInfo(std::move(info));
         if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_UPDATE_CHECK_DONE, 0, reinterpret_cast<LPARAM>(heap));
         else delete heap;
+    }).detach();
+}
+
+void StartRollbackSelfTest() {
+    if (g_busy.exchange(true)) return;
+    const fs::path updater = UpdaterExePath();
+    if (!fs::exists(updater)) {
+        g_busy = false;
+        MessageBoxW(g_hwnd, L"找不到 VRFullKeyboardUpdater.exe。\n請先按「建置最新版」。",
+                    L"更新可靠性測試", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    SetBusy(true);
+    if (g_developerMode) SetLogExpanded(true);
+    AppendLog(L"\r\n==============================\r\n更新回復機制自我測試\r\n==============================\r\n");
+    const fs::path testRoot = UpdateBasePath() / L"rollback_self_test";
+    std::thread([updater, testRoot]() {
+        const int code = RunProcessCapture(updater, {L"--self-test-dir", testRoot.wstring()}, g_root);
+        auto* done = new TaskDone();
+        done->success = (code == 0);
+        done->summary = done->success
+            ? L"Rollback 自我測試通過：備份、還原、新增檔案清理與 INI 保護皆正常。"
+            : L"Rollback 自我測試失敗，請查看完整建置記錄。";
+        if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(done));
+        else delete done;
     }).detach();
 }
 
@@ -1073,13 +1166,14 @@ ButtonVisual GetButtonVisual(int id) {
     case IDC_RUN_VR: return {L"啟動 VR 鍵盤", L"連接 SteamVR 並開啟鍵盤 Overlay", ButtonTone::Primary};
     case IDC_PREVIEW: return {L"桌面預覽", L"不戴頭顯也能檢查鍵盤畫面", ButtonTone::Secondary};
     case IDC_EDITOR: return {L"編輯預覽", L"調整外觀、位置、快捷鍵與九方模式", ButtonTone::Secondary};
-    case IDC_UPDATE: return {L"更新與版本", L"檢查 GitHub、驗證並安裝新版", ButtonTone::Accent};
+    case IDC_UPDATE: return {L"更新與版本", g_updateButtonSubtitle.c_str(), g_updateAvailableHint ? ButtonTone::Primary : ButtonTone::Accent};
     case IDC_BUILD: return {L"建置最新版", L"編譯 VRFullKeyboard.exe", ButtonTone::Secondary};
     case IDC_PACKAGE: return {L"建立分享版", L"產生免建置 ZIP 與 SHA256", ButtonTone::Primary};
     case IDC_CLEAN: return {L"清除建置快取", L"刪除 build，不動設定與發行包", ButtonTone::Danger};
     case IDC_OPEN_OUTPUT: return {L"開啟程式位置", L"定位目前建置完成的核心程式", ButtonTone::Utility};
     case IDC_OPEN_ROOT: return {g_developerMode ? L"專案資料夾" : L"程式資料夾", L"在檔案總管開啟目前資料夾", ButtonTone::Utility};
     case IDC_OPEN_LOG: return {L"完整建置記錄", L"使用記事本查看完整 Log", ButtonTone::Utility};
+    case IDC_ROLLBACK_TEST: return {L"測試更新回復", L"在隔離暫存區驗證備份與 Rollback", ButtonTone::Utility};
     case IDC_SHORTCUT: return {L"建立桌面捷徑", L"從桌面直接開啟控制中心", ButtonTone::Utility};
     case IDC_LOG_TOGGLE: return {g_logExpanded ? L"收合記錄" : L"展開記錄", L"", ButtonTone::Utility};
     case IDC_LOG_CLEAR: return {L"清空畫面", L"", ButtonTone::Utility};
@@ -1352,7 +1446,7 @@ void Layout(HWND hwnd) {
     placeRow(lm.launchCard, {IDC_RUN_VR, IDC_PREVIEW, IDC_EDITOR, IDC_UPDATE}, ScaleForDpi(70, dpi));
     if (g_developerMode) {
         placeRow(lm.devCard, {IDC_BUILD, IDC_PACKAGE, IDC_CLEAN, IDC_OPEN_OUTPUT}, ScaleForDpi(58, dpi));
-        placeRow(lm.toolsCard, {IDC_OPEN_ROOT, IDC_OPEN_LOG, IDC_SHORTCUT}, ScaleForDpi(50, dpi));
+        placeRow(lm.toolsCard, {IDC_OPEN_ROOT, IDC_OPEN_LOG, IDC_ROLLBACK_TEST, IDC_SHORTCUT}, ScaleForDpi(50, dpi));
 
         const int actionW = ScaleForDpi(104, dpi);
         const int actionH = ScaleForDpi(32, dpi);
@@ -1405,6 +1499,9 @@ void PaintWindow(HWND hwnd, HDC dc) {
         DrawPill(dc, pillX, pillY, g_cmakeReady ? L"CMake OK" : L"CMake 未找到", g_cmakeReady ? kGreen : kRed, dpi);
         DrawPill(dc, pillX, pillY, g_gitReady ? L"Git OK" : L"Git 未找到", g_gitReady ? kGreen : kRed, dpi);
     }
+    if (!g_developerMode && g_updateAvailableHint && !g_updateAvailableTag.empty()) {
+        DrawPill(dc, pillX, pillY, L"有新版 " + g_updateAvailableTag, kAmber, dpi);
+    }
 
     DrawSectionTitle(dc, L"啟動", lm.launchLabelY, hwnd);
     FillRounded(dc, lm.launchCard, ScaleForDpi(12, dpi), kPanel, RGB(34, 44, 59));
@@ -1452,6 +1549,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_developerMode) {
             MakeButton(hwnd, IDC_OPEN_ROOT);
             MakeButton(hwnd, IDC_OPEN_LOG);
+            g_taskButtons.push_back(MakeButton(hwnd, IDC_ROLLBACK_TEST));
             MakeButton(hwnd, IDC_LOG_TOGGLE);
             MakeButton(hwnd, IDC_LOG_CLEAR);
             MakeButton(hwnd, IDC_LOG_COPY);
@@ -1479,6 +1577,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         RefreshStatus();
         Layout(hwnd);
+        if (!g_developerMode) SetTimer(hwnd, TIMER_BACKGROUND_UPDATE, 1600, nullptr);
         return 0;
     }
     case WM_GETMINMAXINFO: {
@@ -1498,6 +1597,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     }
+    case WM_TIMER:
+        if (wParam == TIMER_BACKGROUND_UPDATE) {
+            KillTimer(hwnd, TIMER_BACKGROUND_UPDATE);
+            if (!g_developerMode) StartUpdateCheckTask(true);
+            return 0;
+        }
+        break;
     case WM_SIZE:
         Layout(hwnd);
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -1533,7 +1639,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_RUN_VR: LaunchCore(PendingLaunch::Vr); break;
         case IDC_PREVIEW: LaunchCore(PendingLaunch::Preview); break;
         case IDC_EDITOR: LaunchCore(PendingLaunch::Editor); break;
-        case IDC_UPDATE: StartUpdateCheckTask(); break;
+        case IDC_UPDATE: StartUpdateCheckTask(false); break;
         case IDC_BUILD: {
             PendingLaunch pending = PendingLaunch::None;
             if (lParam >= (LPARAM)PendingLaunch::Vr && lParam <= (LPARAM)PendingLaunch::Update) pending = (PendingLaunch)lParam;
@@ -1545,6 +1651,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_OPEN_OUTPUT: OpenOutput(); break;
         case IDC_OPEN_ROOT: OpenFolder(g_root); break;
         case IDC_OPEN_LOG: OpenBuildLog(); break;
+        case IDC_ROLLBACK_TEST: StartRollbackSelfTest(); break;
         case IDC_SHORTCUT: {
             const bool ok = CreateDesktopShortcut();
             MessageBoxW(hwnd, ok ? L"桌面捷徑已建立。" : L"建立桌面捷徑失敗。",
@@ -1564,13 +1671,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (text) AppendLog(*text);
         return 0;
     }
+    case WM_APP_UPDATE_PROGRESS: {
+        std::unique_ptr<std::wstring> progress(reinterpret_cast<std::wstring*>(lParam));
+        if (progress) {
+            g_updateButtonSubtitle = *progress;
+            if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
     case WM_APP_UPDATE_CHECK_DONE: {
         std::unique_ptr<UpdateReleaseInfo> info(reinterpret_cast<UpdateReleaseInfo*>(lParam));
-        SetBusy(false);
+        g_updateCheckBusy = false;
         if (!info) return 0;
+        if (!info->silent) SetBusy(false);
+        if (info->silent) {
+            if (info->success && info->updateAvailable) {
+                g_updateAvailableHint = true;
+                g_updateAvailableTag = Utf8ToWide(info->tag);
+                g_updateButtonSubtitle = L"有新版 " + g_updateAvailableTag + L" 可安裝";
+                AppendPersistentLog(L"[更新] 背景檢查發現新版：" + g_updateAvailableTag + L"\r\n");
+            } else if (info->success) {
+                g_updateAvailableHint = false;
+                g_updateAvailableTag.clear();
+                g_updateButtonSubtitle = L"目前已是最新版";
+            } else {
+                AppendPersistentLog(L"[更新] 背景檢查失敗：" + info->error + L"\r\n");
+            }
+            if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (!info->success) {
             const std::wstring message = info->error.empty() ? L"無法檢查更新。" : info->error;
             AppendLog(L"[更新] " + message + L"\r\n");
+            g_updateButtonSubtitle = L"檢查失敗，點此重試";
+            if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
             MessageBoxW(hwnd, message.c_str(), L"檢查更新失敗", MB_ICONWARNING | MB_OK);
             return 0;
         }
@@ -1579,9 +1715,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                          L"\nGitHub 最新版本：" + Utf8ToWide(info->tag) +
                                          L"\n\n目前已是最新版。";
             AppendLog(L"[更新] 已是最新版：" + Utf8ToWide(info->tag) + L"\r\n");
+            g_updateAvailableHint = false;
+            g_updateAvailableTag.clear();
+            g_updateButtonSubtitle = L"目前已是最新版";
+            if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
             MessageBoxW(hwnd, message.c_str(), L"VR Full Keyboard 更新", MB_ICONINFORMATION | MB_OK);
             return 0;
         }
+
+        g_updateAvailableHint = true;
+        g_updateAvailableTag = Utf8ToWide(info->tag);
+        g_updateButtonSubtitle = L"有新版 " + g_updateAvailableTag + L" 可安裝";
+        if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
+        InvalidateRect(hwnd, nullptr, FALSE);
 
         std::wstring notes = Utf8ToWide(info->notes);
         if (notes.size() > 1400) notes = notes.substr(0, 1400) + L"\n...";
@@ -1619,6 +1765,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RefreshStatus();
         if (done) {
             AppendLog(L"\r\n" + done->summary + L"\r\n");
+            if (!done->success && done->summary.find(L"更新") != std::wstring::npos) {
+                g_updateButtonSubtitle = L"更新失敗，可點此重試";
+                if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
+            }
             if (!done->success) MessageBoxW(hwnd, done->summary.c_str(), L"作業未完成", MB_ICONWARNING);
             else if (done->pendingLaunch != 0) LaunchCore((PendingLaunch)done->pendingLaunch);
             else MessageBoxW(hwnd, done->summary.c_str(), L"完成", MB_ICONINFORMATION);
@@ -1637,6 +1787,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
+std::wstring CommandLineOption(const wchar_t* name) {
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return {};
+    std::wstring value;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (_wcsicmp(argv[i], name) == 0) {
+            value = argv[i + 1];
+            break;
+        }
+    }
+    LocalFree(argv);
+    return value;
+}
+
+std::wstring CleanVersionForDisplay(std::wstring value) {
+    if (!value.empty() && (value.front() == L'v' || value.front() == L'V')) value.erase(value.begin());
+    return value;
+}
+
+void ShowStartupUpdateResult() {
+    if (g_developerMode) return;
+    const std::wstring result = CommandLineOption(L"--update-result");
+    if (result.empty()) return;
+    const std::wstring from = CleanVersionForDisplay(CommandLineOption(L"--from-version"));
+    const std::wstring to = CleanVersionForDisplay(CommandLineOption(L"--to-version"));
+    if (_wcsicmp(result.c_str(), L"success") == 0) {
+        std::wstring message = L"更新完成。";
+        if (!from.empty() && !to.empty()) message += L"\n\n" + from + L"  →  " + to;
+        message += L"\n\n個人設定已保留，上一版備份只保留最近一份。";
+        MessageBoxW(g_hwnd, message.c_str(), L"VR Full Keyboard 更新成功", MB_ICONINFORMATION | MB_OK);
+    } else if (_wcsicmp(result.c_str(), L"rollback") == 0) {
+        std::wstring message = L"新版啟動驗證失敗，已自動還原上一個可用版本。";
+        if (!from.empty() && !to.empty()) message += L"\n\n原版本：" + from + L"\n嘗試版本：" + to;
+        MessageBoxW(g_hwnd, message.c_str(), L"VR Full Keyboard 已自動還原", MB_ICONWARNING | MB_OK);
+    }
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
@@ -1681,6 +1869,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     ShowWindow(g_hwnd, nCmdShow);
     UpdateWindow(g_hwnd);
+    ShowStartupUpdateResult();
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

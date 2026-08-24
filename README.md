@@ -2,7 +2,7 @@
 
 SteamVR virtual full-size keyboard for Windows, with Traditional Chinese / Bopomofo support, Q9/Numpad mode, macros, wrist summon controls, desktop preview, editor preview, and a native Control Center.
 
-Current version: **3.9.1**
+Current version: **3.9.2**
 
 ## Source / developer version
 
@@ -27,12 +27,16 @@ The Control Center is bound to the official public repository:
 
 `tw2323123/VRFullKeyboard`
 
-**更新與版本** checks the latest GitHub Release, downloads the fixed Windows ZIP and SHA256 assets, verifies the package, extracts it to a staging directory, then launches `VRFullKeyboardUpdater.exe` to replace application files safely.
+**更新與版本** checks the latest GitHub Release, downloads the fixed Windows ZIP and SHA256 assets, verifies the package, extracts it to a staging directory, then launches `VRFullKeyboardUpdater.exe` to replace application files safely. Share builds also perform a quiet background check shortly after launch and surface an available version directly on the update card.
 
-`VRFullKeyboard.ini` is never included in release packages and is explicitly protected by the updater, so personal settings are preserved.
+`VRFullKeyboard.ini` is never included in release packages and is explicitly protected by the updater, so personal settings are preserved. The updater keeps only one `backup_previous` snapshot, validates that the relaunched Control Center remains alive briefly, and rolls back automatically if the new Control Center exits immediately.
 
 **Upgrade note:** v3.9.0 is the first release that contains the bound repository and native updater. Existing v3.8.6 users must install v3.9.0 manually once; later releases can be installed from the Control Center.
 
 ## Release automation
 
 GitHub Actions builds the Windows package on pushes and pull requests. Pushing a tag such as `v3.9.1` whose value matches `VERSION` also creates/updates the GitHub Release and uploads the ZIP + SHA256 assets automatically.
+
+## Update reliability test
+
+Developer builds include **測試更新回復**, an isolated self-test for backup/restore behavior. It does not modify the real installation.

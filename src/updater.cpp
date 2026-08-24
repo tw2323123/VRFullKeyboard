@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -93,6 +94,21 @@ bool CopyFileSafe(const fs::path& from, const fs::path& to) {
     return !ec;
 }
 
+bool WriteText(const fs::path& path, const std::string& text) {
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return !!out;
+}
+
+std::string ReadText(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
 bool RestoreBackup(const fs::path& backupDir, const fs::path& installDir,
                    const std::vector<fs::path>& newlyCreated) {
     std::error_code ec;
@@ -110,14 +126,15 @@ bool RestoreBackup(const fs::path& backupDir, const fs::path& installDir,
     return true;
 }
 
-bool ApplyUpdate(const fs::path& stageDir, const fs::path& installDir, const fs::path& backupDir) {
+bool ApplyUpdate(const fs::path& stageDir, const fs::path& installDir, const fs::path& backupDir,
+                 std::vector<fs::path>& newlyCreated) {
     std::error_code ec;
     fs::remove_all(backupDir, ec);
     ec.clear();
     fs::create_directories(backupDir, ec);
     if (ec) return false;
 
-    std::vector<fs::path> newlyCreated;
+    newlyCreated.clear();
     for (fs::recursive_directory_iterator it(stageDir, ec), end; !ec && it != end; it.increment(ec)) {
         if (!it->is_regular_file()) continue;
         const fs::path rel = fs::relative(it->path(), stageDir, ec);
@@ -149,8 +166,10 @@ bool ApplyUpdate(const fs::path& stageDir, const fs::path& installDir, const fs:
     return true;
 }
 
-bool LaunchProgram(const fs::path& exe, const fs::path& cwd) {
+bool LaunchProgramChecked(const fs::path& exe, const fs::path& cwd,
+                          const std::vector<std::wstring>& args, DWORD healthWaitMs) {
     std::wstring command = Quote(exe.wstring());
+    for (const auto& arg : args) command += L" " + Quote(arg);
     std::vector<wchar_t> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(L'\0');
     STARTUPINFOW si{};
@@ -158,11 +177,46 @@ bool LaunchProgram(const fs::path& exe, const fs::path& cwd) {
     PROCESS_INFORMATION pi{};
     const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
                                    0, nullptr, cwd.wstring().c_str(), &si, &pi);
-    if (ok) {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+    if (!ok) return false;
+    CloseHandle(pi.hThread);
+    if (healthWaitMs > 0) {
+        const DWORD wait = WaitForSingleObject(pi.hProcess, healthWaitMs);
+        if (wait == WAIT_OBJECT_0) {
+            CloseHandle(pi.hProcess);
+            return false;
+        }
     }
-    return ok != FALSE;
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+bool RunRollbackSelfTest(const fs::path& root) {
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    const fs::path install = root / L"install";
+    const fs::path stage = root / L"stage";
+    const fs::path backup = root / L"backup";
+    fs::create_directories(install, ec);
+    fs::create_directories(stage, ec);
+    if (ec) return false;
+
+    if (!WriteText(install / L"core.bin", "old-core") ||
+        !WriteText(install / L"VRFullKeyboard.ini", "user-settings") ||
+        !WriteText(stage / L"core.bin", "new-core") ||
+        !WriteText(stage / L"new-file.bin", "new-file") ||
+        !WriteText(stage / L"VRFullKeyboard.ini", "must-not-overwrite")) return false;
+
+    std::vector<fs::path> newlyCreated;
+    if (!ApplyUpdate(stage, install, backup, newlyCreated)) return false;
+    const bool applied = ReadText(install / L"core.bin") == "new-core" &&
+                         ReadText(install / L"VRFullKeyboard.ini") == "user-settings" &&
+                         fs::exists(install / L"new-file.bin");
+    const bool restored = RestoreBackup(backup, install, newlyCreated) &&
+                          ReadText(install / L"core.bin") == "old-core" &&
+                          ReadText(install / L"VRFullKeyboard.ini") == "user-settings" &&
+                          !fs::exists(install / L"new-file.bin");
+    fs::remove_all(root, ec);
+    return applied && restored;
 }
 
 void ScheduleCleanup(const fs::path& updateRoot) {
@@ -176,10 +230,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 2;
 
+    const fs::path selfTestDir = ArgValue(argc, argv, L"--self-test-dir");
+    if (!selfTestDir.empty()) {
+        LocalFree(argv);
+        return RunRollbackSelfTest(selfTestDir) ? 0 : 20;
+    }
+
     const fs::path installDir = ArgValue(argc, argv, L"--install-dir");
     const fs::path stageDir = ArgValue(argc, argv, L"--stage-dir");
     const fs::path backupDir = ArgValue(argc, argv, L"--backup-dir");
     const fs::path relaunch = ArgValue(argc, argv, L"--relaunch");
+    const std::wstring fromVersion = ArgValue(argc, argv, L"--from-version");
+    const std::wstring toVersion = ArgValue(argc, argv, L"--to-version");
     const DWORD parentPid = ArgDword(argc, argv, L"--parent-pid");
     LocalFree(argv);
 
@@ -192,18 +254,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     StopOwnProcess(L"VRFullKeyboard.exe");
     StopOwnProcess(L"VRFullKeyboardControl.exe");
 
-    if (!ApplyUpdate(stageDir, installDir, backupDir)) {
-        MessageBoxW(nullptr,
-                    L"更新檔案套用失敗，已嘗試還原舊版本。\n\n請重新開啟 VR Full Keyboard。",
-                    L"VR Full Keyboard 更新失敗", MB_ICONERROR | MB_OK);
+    std::vector<fs::path> newlyCreated;
+    if (!ApplyUpdate(stageDir, installDir, backupDir, newlyCreated)) {
+        const fs::path oldControl = installDir / relaunch;
+        LaunchProgramChecked(oldControl, installDir,
+            {L"--update-result", L"rollback", L"--from-version", fromVersion, L"--to-version", toVersion}, 0);
         return 5;
     }
 
     const fs::path launchPath = installDir / relaunch;
-    if (!LaunchProgram(launchPath, installDir)) {
-        MessageBoxW(nullptr,
-                    L"新版檔案已安裝，但控制中心無法自動重新啟動。\n\n請手動開啟 VRFullKeyboardControl.exe。",
-                    L"VR Full Keyboard", MB_ICONWARNING | MB_OK);
+    if (!LaunchProgramChecked(launchPath, installDir,
+            {L"--update-result", L"success", L"--from-version", fromVersion, L"--to-version", toVersion}, 2500)) {
+        StopOwnProcess(L"VRFullKeyboardControl.exe");
+        const bool restored = RestoreBackup(backupDir, installDir, newlyCreated);
+        if (restored) {
+            LaunchProgramChecked(installDir / relaunch, installDir,
+                {L"--update-result", L"rollback", L"--from-version", fromVersion, L"--to-version", toVersion}, 0);
+        } else {
+            MessageBoxW(nullptr,
+                        L"新版控制中心啟動失敗，而且自動還原未完整成功。\n\n請從 GitHub Release 重新下載分享版。",
+                        L"VR Full Keyboard 更新失敗", MB_ICONERROR | MB_OK);
+        }
         return 6;
     }
 
