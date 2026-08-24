@@ -223,8 +223,8 @@ double g_wristPressStartTime = 0.0;
 bool g_wristLongPressTriggered = false;
 bool g_fontRestartRequired = false;
 
-// V3.8 GitHub Release update-check state. V3.8 only checks and opens the
-// Release page; downloading/replacing files is deliberately left for V3.9.
+// GitHub Release update-check state. The VR overlay can check and display
+// release information; installation is handled by the native Control Center updater.
 enum class UpdateCheckState { Idle, Checking, UpToDate, Available, Error, NotConfigured };
 struct UpdateCheckResult {
     UpdateCheckState state = UpdateCheckState::Idle;
@@ -563,7 +563,7 @@ bool HttpGetLatestRelease(std::string& response, DWORD& statusCode, std::string&
 
     static constexpr wchar_t headers[] =
         L"Accept: application/vnd.github+json\r\n"
-        L"X-GitHub-Api-Version: 2022-11-28\r\n";
+        L"X-GitHub-Api-Version: 2026-03-10\r\n";
     WinHttpAddRequestHeaders(request, headers, -1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
 
     const bool sent = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -2135,7 +2135,7 @@ void DrawUpdatePage() {
         ImGui::Text("更新來源：%s / %s", VRFK_GITHUB_OWNER, VRFK_GITHUB_REPO);
     } else {
         ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.28f, 1.0f), "尚未綁定 GitHub Repository");
-        ImGui::TextWrapped("V3.8 已完成更新檢查功能，但目前還沒有正式 GitHub 倉庫位址。建立正式倉庫後，只需要填入固定的 Owner / Repository 即可啟用。");
+        ImGui::TextWrapped("此建置版本沒有設定官方 GitHub 更新來源。");
     }
 
     bool autoCheck = g_ui.autoCheckUpdates;
@@ -2189,8 +2189,8 @@ void DrawUpdatePage() {
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::TextDisabled("V3.8 只負責檢查版本與顯示 Release 資訊，不會下載或覆蓋任何程式檔案。");
-    ImGui::TextDisabled("自動下載、SHA256 驗證、備份與更新器會在下一階段加入。");
+    ImGui::TextDisabled("VR 畫面內可檢查 Release 資訊；下載與安裝請使用控制中心的「更新與版本」。");
+    ImGui::TextDisabled("控制中心會驗證 SHA256、備份舊版並以獨立更新器安全替換檔案。");
 }
 
 void DrawFunctionRow() {

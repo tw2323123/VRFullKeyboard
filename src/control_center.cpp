@@ -5,8 +5,11 @@
 #include <shobjidl.h>
 #include <bcrypt.h>
 #include <dwmapi.h>
+#include <winhttp.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cwctype>
 #include <cstring>
 #include <atomic>
@@ -15,9 +18,11 @@
 #include <iomanip>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_set>
 #include <vector>
 
@@ -28,6 +33,8 @@ namespace fs = std::filesystem;
 namespace {
 constexpr UINT WM_APP_LOG = WM_APP + 1;
 constexpr UINT WM_APP_TASK_DONE = WM_APP + 2;
+constexpr UINT WM_APP_UPDATE_CHECK_DONE = WM_APP + 3;
+constexpr UINT WM_APP_UPDATE_EXIT = WM_APP + 4;
 
 constexpr int IDC_STATUS = 1001;
 constexpr int IDC_ENV = 1002;
@@ -51,6 +58,18 @@ struct TaskDone {
     bool success = false;
     int pendingLaunch = 0;
     std::wstring summary;
+};
+
+struct UpdateReleaseInfo {
+    bool success = false;
+    bool updateAvailable = false;
+    std::string tag;
+    std::string name;
+    std::string notes;
+    std::string pageUrl;
+    std::string zipUrl;
+    std::string shaUrl;
+    std::wstring error;
 };
 
 enum class PendingLaunch : int { None = 0, Vr = 1, Preview = 2, Editor = 3, Update = 4 };
@@ -136,6 +155,11 @@ fs::path CoreExePath() {
 fs::path OpenVrDllPath() {
     if (g_developerMode) return g_root / L"build" / L"Release" / L"openvr_api.dll";
     return g_root / L"openvr_api.dll";
+}
+
+fs::path UpdaterExePath() {
+    if (g_developerMode) return g_root / L"build" / L"Release" / L"VRFullKeyboardUpdater.exe";
+    return g_root / L"VRFullKeyboardUpdater.exe";
 }
 
 std::wstring EnvValue(const wchar_t* name) {
@@ -245,6 +269,12 @@ void SetBusy(bool busy) {
         EnableWindow(button, busy ? FALSE : TRUE);
         InvalidateRect(button, nullptr, TRUE);
     }
+    if (g_hwnd) {
+        if (HWND update = GetDlgItem(g_hwnd, IDC_UPDATE)) {
+            EnableWindow(update, busy ? FALSE : TRUE);
+            InvalidateRect(update, nullptr, TRUE);
+        }
+    }
 }
 
 void RefreshStatus() {
@@ -318,7 +348,7 @@ bool BuildCore(const fs::path& cmake) {
     const int result = RunProcessCapture(cmake, {
         L"--build", (g_root / L"build").wstring(),
         L"--config", L"Release",
-        L"--target", L"VRFullKeyboard",
+        L"--target", L"VRFullKeyboard", L"VRFullKeyboardUpdater",
         L"--parallel"
     }, g_root);
     if (result == 0) {
@@ -360,6 +390,296 @@ std::wstring Sha256File(const fs::path& path) {
     return out.str();
 }
 
+
+std::string TrimAscii(std::string value) {
+    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
+    value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
+    return value;
+}
+
+void AppendUtf8Codepoint(std::string& out, unsigned int cp) {
+    if (cp <= 0x7F) out.push_back(static_cast<char>(cp));
+    else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+int HexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+bool ExtractJsonStringAt(const std::string& json, const char* key, size_t start, std::string& out) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = json.find(needle, start);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+    if (pos >= json.size() || json[pos] != '"') return false;
+    ++pos;
+    out.clear();
+    while (pos < json.size()) {
+        char c = json[pos++];
+        if (c == '"') return true;
+        if (c != '\\') { out.push_back(c); continue; }
+        if (pos >= json.size()) return false;
+        const char esc = json[pos++];
+        switch (esc) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                if (pos + 4 > json.size()) return false;
+                unsigned int cp = 0;
+                for (int i = 0; i < 4; ++i) {
+                    const int h = HexNibble(json[pos + i]);
+                    if (h < 0) return false;
+                    cp = (cp << 4) | static_cast<unsigned int>(h);
+                }
+                pos += 4;
+                AppendUtf8Codepoint(out, cp);
+                break;
+            }
+            default: return false;
+        }
+    }
+    return false;
+}
+
+bool ExtractJsonString(const std::string& json, const char* key, std::string& out) {
+    return ExtractJsonStringAt(json, key, 0, out);
+}
+
+bool ParseSemVer(const std::string& raw, std::array<int, 3>& out) {
+    std::string value = TrimAscii(raw);
+    if (!value.empty() && (value[0] == 'v' || value[0] == 'V')) value.erase(value.begin());
+    const size_t suffix = value.find_first_of("-+");
+    if (suffix != std::string::npos) value.resize(suffix);
+    size_t start = 0;
+    for (int i = 0; i < 3; ++i) {
+        const size_t dot = value.find('.', start);
+        const size_t end = (i == 2) ? value.size() : dot;
+        if (end == std::string::npos || end <= start) return false;
+        const std::string part = value.substr(start, end - start);
+        if (!std::all_of(part.begin(), part.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) return false;
+        try { out[static_cast<size_t>(i)] = std::stoi(part); } catch (...) { return false; }
+        if (i < 2) {
+            if (dot == std::string::npos) return false;
+            start = dot + 1;
+        }
+    }
+    return true;
+}
+
+int CompareSemVer(const std::string& lhs, const std::string& rhs) {
+    std::array<int, 3> a{}, b{};
+    if (!ParseSemVer(lhs, a) || !ParseSemVer(rhs, b)) return 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+    }
+    return 0;
+}
+
+bool HttpGetUrl(const std::wstring& url, std::vector<char>& data, DWORD& statusCode,
+                std::wstring& error, bool githubApi = false) {
+    data.clear();
+    statusCode = 0;
+    error.clear();
+
+    URL_COMPONENTSW parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) {
+        error = L"無法解析下載網址。";
+        return false;
+    }
+    if (parts.nScheme != INTERNET_SCHEME_HTTPS) {
+        error = L"更新器只允許 HTTPS 下載。";
+        return false;
+    }
+
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    if (path.empty()) path = L"/";
+
+    const std::wstring userAgent = L"VRFullKeyboard/" + Utf8ToWide(VRFK_VERSION_STRING);
+    HINTERNET session = WinHttpOpen(userAgent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) { error = L"WinHTTP 初始化失敗。"; return false; }
+    WinHttpSetTimeouts(session, 6000, 6000, 15000, 15000);
+
+    HINTERNET connection = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
+    if (!connection) {
+        error = L"無法連線更新伺服器。";
+        WinHttpCloseHandle(session);
+        return false;
+    }
+    HINTERNET request = WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                           WINHTTP_FLAG_SECURE);
+    if (!request) {
+        error = L"無法建立更新請求。";
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+    if (githubApi) {
+        static constexpr wchar_t headers[] =
+            L"Accept: application/vnd.github+json\r\n"
+            L"X-GitHub-Api-Version: 2026-03-10\r\n";
+        WinHttpAddRequestHeaders(request, headers, -1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    }
+
+    const bool sent = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                         WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE;
+    const bool received = sent && WinHttpReceiveResponse(request, nullptr) != FALSE;
+    if (!received) {
+        error = L"下載請求失敗，錯誤碼 " + std::to_wstring(GetLastError());
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode < 200 || statusCode >= 300) {
+        error = L"伺服器回傳 HTTP " + std::to_wstring(statusCode);
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    constexpr size_t kMaxDownload = 256ull * 1024ull * 1024ull;
+    while (data.size() < kMaxDownload) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available)) {
+            error = L"讀取下載資料失敗。";
+            break;
+        }
+        if (!available) break;
+        const size_t room = kMaxDownload - data.size();
+        const DWORD want = static_cast<DWORD>((std::min)(room, static_cast<size_t>(available)));
+        const size_t old = data.size();
+        data.resize(old + want);
+        DWORD read = 0;
+        if (!WinHttpReadData(request, data.data() + old, want, &read)) {
+            data.resize(old);
+            error = L"下載資料失敗。";
+            break;
+        }
+        data.resize(old + read);
+        if (!read) break;
+    }
+    if (data.size() >= kMaxDownload && error.empty()) error = L"下載檔案超過安全大小限制。";
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    return error.empty();
+}
+
+bool DownloadToFile(const std::string& urlUtf8, const fs::path& destination, std::wstring& error) {
+    std::vector<char> data;
+    DWORD status = 0;
+    if (!HttpGetUrl(Utf8ToWide(urlUtf8), data, status, error, false)) return false;
+    std::error_code ec;
+    fs::create_directories(destination.parent_path(), ec);
+    std::ofstream out(destination, std::ios::binary | std::ios::trunc);
+    if (!out) { error = L"無法建立下載檔案。"; return false; }
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (!out) { error = L"寫入下載檔案失敗。"; return false; }
+    return true;
+}
+
+bool FindAssetUrl(const std::string& json, const std::string& assetName, std::string& url) {
+    size_t pos = 0;
+    while ((pos = json.find("\"browser_download_url\"", pos)) != std::string::npos) {
+        std::string candidate;
+        if (!ExtractJsonStringAt(json, "browser_download_url", pos, candidate)) return false;
+        if (candidate.size() >= assetName.size() &&
+            candidate.compare(candidate.size() - assetName.size(), assetName.size(), assetName) == 0) {
+            url = std::move(candidate);
+            return true;
+        }
+        ++pos;
+    }
+    return false;
+}
+
+UpdateReleaseInfo FetchLatestRelease() {
+    UpdateReleaseInfo info;
+    const std::wstring api = L"https://api.github.com/repos/" + Utf8ToWide(VRFK_GITHUB_OWNER) +
+                             L"/" + Utf8ToWide(VRFK_GITHUB_REPO) + L"/releases/latest";
+    std::vector<char> bytes;
+    DWORD status = 0;
+    if (!HttpGetUrl(api, bytes, status, info.error, true)) return info;
+    const std::string json(bytes.begin(), bytes.end());
+
+    if (!ExtractJsonString(json, "tag_name", info.tag)) {
+        info.error = L"GitHub Release 缺少版本標籤。";
+        return info;
+    }
+    std::array<int, 3> parsed{};
+    if (!ParseSemVer(info.tag, parsed)) {
+        info.error = L"GitHub Release 版本格式不是 vMAJOR.MINOR.PATCH。";
+        return info;
+    }
+    ExtractJsonString(json, "name", info.name);
+    ExtractJsonString(json, "body", info.notes);
+    ExtractJsonString(json, "html_url", info.pageUrl);
+    if (!FindAssetUrl(json, "VRFullKeyboard_Windows_x64.zip", info.zipUrl) ||
+        !FindAssetUrl(json, "VRFullKeyboard_Windows_x64.sha256", info.shaUrl)) {
+        info.error = L"最新 Release 缺少自動更新需要的 ZIP 或 SHA256 資產。";
+        return info;
+    }
+    if (info.notes.size() > 2200) {
+        info.notes.resize(2200);
+        info.notes += "\n...";
+    }
+    info.updateAvailable = CompareSemVer(info.tag, VRFK_VERSION_STRING) > 0;
+    info.success = true;
+    return info;
+}
+
+std::wstring ExpectedSha256(const fs::path& shaFile) {
+    std::ifstream in(shaFile, std::ios::binary);
+    if (!in) return {};
+    std::string token;
+    in >> token;
+    if (token.size() != 64) return {};
+    if (!std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isxdigit(c) != 0; })) return {};
+    std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return Utf8ToWide(token);
+}
+
 std::wstring EscapePowerShellSingleQuoted(const std::wstring& value) {
     std::wstring out;
     out.reserve(value.size() + 8);
@@ -368,6 +688,133 @@ std::wstring EscapePowerShellSingleQuoted(const std::wstring& value) {
         else out += ch;
     }
     return out;
+}
+
+
+fs::path UpdateBasePath() {
+    const std::wstring local = EnvValue(L"LOCALAPPDATA");
+    fs::path base = local.empty() ? g_root : fs::path(local);
+    return base / L"VRFullKeyboard" / L"updates";
+}
+
+bool LaunchUpdaterProcess(const fs::path& updater, const fs::path& installDir,
+                          const fs::path& stageDir, const fs::path& backupDir) {
+    const DWORD parentPid = GetCurrentProcessId();
+    std::wstring command = Quote(updater.wstring()) +
+        L" --install-dir " + Quote(installDir.wstring()) +
+        L" --stage-dir " + Quote(stageDir.wstring()) +
+        L" --backup-dir " + Quote(backupDir.wstring()) +
+        L" --parent-pid " + std::to_wstring(parentPid) +
+        L" --relaunch " + Quote(L"VRFullKeyboardControl.exe");
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
+                                   0, nullptr, stageDir.wstring().c_str(), &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    return ok != FALSE;
+}
+
+bool DownloadAndStartUpdate(const UpdateReleaseInfo& info, std::wstring& error) {
+    const fs::path updateRoot = UpdateBasePath() / Utf8ToWide(info.tag);
+    const fs::path zip = updateRoot / L"VRFullKeyboard_Windows_x64.zip";
+    const fs::path sha = updateRoot / L"VRFullKeyboard_Windows_x64.sha256";
+    const fs::path stage = updateRoot / L"stage";
+    const fs::path backup = updateRoot / L"backup";
+
+    std::error_code ec;
+    fs::remove_all(updateRoot, ec);
+    ec.clear();
+    fs::create_directories(updateRoot, ec);
+    if (ec) { error = L"無法建立更新暫存資料夾。"; return false; }
+
+    PostLog(L"[更新] 下載 " + Utf8ToWide(info.tag) + L"...\r\n");
+    if (!DownloadToFile(info.zipUrl, zip, error)) return false;
+    if (!DownloadToFile(info.shaUrl, sha, error)) return false;
+
+    const std::wstring expected = ExpectedSha256(sha);
+    const std::wstring actual = Sha256File(zip);
+    if (expected.empty() || actual.empty() || _wcsicmp(expected.c_str(), actual.c_str()) != 0) {
+        error = L"SHA256 驗證失敗。更新已中止，現有版本不會被修改。";
+        return false;
+    }
+    PostLog(L"[更新] SHA256 驗證成功。\r\n");
+
+    const fs::path powershell = SearchProgram(L"powershell.exe");
+    if (powershell.empty()) { error = L"找不到 Windows PowerShell，無法解壓更新。"; return false; }
+    fs::remove_all(stage, ec);
+    ec.clear();
+    fs::create_directories(stage, ec);
+    const std::wstring command =
+        L"Expand-Archive -LiteralPath '" + EscapePowerShellSingleQuoted(zip.wstring()) +
+        L"' -DestinationPath '" + EscapePowerShellSingleQuoted(stage.wstring()) + L"' -Force";
+    if (RunProcessCapture(powershell, {L"-NoProfile", L"-ExecutionPolicy", L"Bypass", L"-Command", command}, g_root) != 0) {
+        error = L"解壓更新失敗。";
+        return false;
+    }
+
+    const std::vector<fs::path> required = {
+        stage / L"VRFullKeyboardControl.exe",
+        stage / L"VRFullKeyboard.exe",
+        stage / L"VRFullKeyboardUpdater.exe",
+        stage / L"openvr_api.dll",
+        stage / L"VERSION.txt"
+    };
+    for (const auto& file : required) {
+        if (!fs::exists(file)) {
+            error = L"更新包內容不完整：" + file.filename().wstring();
+            return false;
+        }
+    }
+    const std::string stagedVersion = TrimAscii(WideToUtf8(ReadTextFile(stage / L"VERSION.txt")));
+    if (stagedVersion.empty() || CompareSemVer(stagedVersion, info.tag) != 0) {
+        error = L"更新包版本與 GitHub Release 標籤不一致。";
+        return false;
+    }
+
+    if (!LaunchUpdaterProcess(stage / L"VRFullKeyboardUpdater.exe", g_root, stage, backup)) {
+        error = L"無法啟動更新器。";
+        return false;
+    }
+    return true;
+}
+
+void StartUpdateInstallTask(UpdateReleaseInfo info) {
+    if (g_busy.exchange(true)) return;
+    if (g_developerMode) SetLogExpanded(true);
+    SetBusy(true);
+    AppendLog(L"\r\n==============================\r\n下載並安裝更新\r\n==============================\r\n");
+    std::thread([info = std::move(info)]() {
+        std::wstring error;
+        const bool ok = DownloadAndStartUpdate(info, error);
+        if (ok) {
+            if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_UPDATE_EXIT, 0, 0);
+        } else {
+            auto* done = new TaskDone();
+            done->success = false;
+            done->summary = error.empty() ? L"更新失敗。" : error;
+            if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(done));
+            else delete done;
+        }
+    }).detach();
+}
+
+void StartUpdateCheckTask() {
+    if (g_busy.exchange(true)) return;
+    if (g_developerMode) SetLogExpanded(true);
+    SetBusy(true);
+    AppendLog(L"\r\n[更新] 正在檢查 GitHub Release...\r\n");
+    std::thread([]() {
+        UpdateReleaseInfo info = FetchLatestRelease();
+        auto* heap = new UpdateReleaseInfo(std::move(info));
+        if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_UPDATE_CHECK_DONE, 0, reinterpret_cast<LPARAM>(heap));
+        else delete heap;
+    }).detach();
 }
 
 bool CreateReleasePackage(const fs::path& cmake) {
@@ -397,6 +844,7 @@ bool CreateReleasePackage(const fs::path& cmake) {
     if (!copy(CoreExePath(), stage / L"VRFullKeyboard.exe")) return false;
     if (!copy(OpenVrDllPath(), stage / L"openvr_api.dll")) return false;
     if (!copy(ModulePath(), stage / L"VRFullKeyboardControl.exe")) return false;
+    if (!copy(UpdaterExePath(), stage / L"VRFullKeyboardUpdater.exe")) return false;
     if (!copy(g_root / L"release_files" / L"README.txt", stage / L"README.txt")) return false;
     if (!copy(g_root / L"VERSION", stage / L"VERSION.txt")) return false;
 
@@ -625,7 +1073,7 @@ ButtonVisual GetButtonVisual(int id) {
     case IDC_RUN_VR: return {L"啟動 VR 鍵盤", L"連接 SteamVR 並開啟鍵盤 Overlay", ButtonTone::Primary};
     case IDC_PREVIEW: return {L"桌面預覽", L"不戴頭顯也能檢查鍵盤畫面", ButtonTone::Secondary};
     case IDC_EDITOR: return {L"編輯預覽", L"調整外觀、位置、快捷鍵與九方模式", ButtonTone::Secondary};
-    case IDC_UPDATE: return {L"更新與版本", L"檢查版本與 GitHub Release 資訊", ButtonTone::Accent};
+    case IDC_UPDATE: return {L"更新與版本", L"檢查 GitHub、驗證並安裝新版", ButtonTone::Accent};
     case IDC_BUILD: return {L"建置最新版", L"編譯 VRFullKeyboard.exe", ButtonTone::Secondary};
     case IDC_PACKAGE: return {L"建立分享版", L"產生免建置 ZIP 與 SHA256", ButtonTone::Primary};
     case IDC_CLEAN: return {L"清除建置快取", L"刪除 build，不動設定與發行包", ButtonTone::Danger};
@@ -1085,7 +1533,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_RUN_VR: LaunchCore(PendingLaunch::Vr); break;
         case IDC_PREVIEW: LaunchCore(PendingLaunch::Preview); break;
         case IDC_EDITOR: LaunchCore(PendingLaunch::Editor); break;
-        case IDC_UPDATE: LaunchCore(PendingLaunch::Update); break;
+        case IDC_UPDATE: StartUpdateCheckTask(); break;
         case IDC_BUILD: {
             PendingLaunch pending = PendingLaunch::None;
             if (lParam >= (LPARAM)PendingLaunch::Vr && lParam <= (LPARAM)PendingLaunch::Update) pending = (PendingLaunch)lParam;
@@ -1116,6 +1564,55 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (text) AppendLog(*text);
         return 0;
     }
+    case WM_APP_UPDATE_CHECK_DONE: {
+        std::unique_ptr<UpdateReleaseInfo> info(reinterpret_cast<UpdateReleaseInfo*>(lParam));
+        SetBusy(false);
+        if (!info) return 0;
+        if (!info->success) {
+            const std::wstring message = info->error.empty() ? L"無法檢查更新。" : info->error;
+            AppendLog(L"[更新] " + message + L"\r\n");
+            MessageBoxW(hwnd, message.c_str(), L"檢查更新失敗", MB_ICONWARNING | MB_OK);
+            return 0;
+        }
+        if (!info->updateAvailable) {
+            const std::wstring message = L"目前版本：" + Utf8ToWide(VRFK_VERSION_STRING) +
+                                         L"\nGitHub 最新版本：" + Utf8ToWide(info->tag) +
+                                         L"\n\n目前已是最新版。";
+            AppendLog(L"[更新] 已是最新版：" + Utf8ToWide(info->tag) + L"\r\n");
+            MessageBoxW(hwnd, message.c_str(), L"VR Full Keyboard 更新", MB_ICONINFORMATION | MB_OK);
+            return 0;
+        }
+
+        std::wstring notes = Utf8ToWide(info->notes);
+        if (notes.size() > 1400) notes = notes.substr(0, 1400) + L"\n...";
+        if (g_developerMode) {
+            std::wstring message = L"GitHub 有新版本：" + Utf8ToWide(info->tag) +
+                                   L"\n目前 Source 版本：" + Utf8ToWide(VRFK_VERSION_STRING) +
+                                   L"\n\n開發版不會用自動更新器覆蓋 Source 專案。\n要開啟 GitHub Release 嗎？";
+            if (!notes.empty()) message += L"\n\n更新內容：\n" + notes;
+            if (MessageBoxW(hwnd, message.c_str(), L"VR Full Keyboard 更新", MB_ICONINFORMATION | MB_YESNO) == IDYES && !info->pageUrl.empty()) {
+                const std::wstring url = Utf8ToWide(info->pageUrl);
+                ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            return 0;
+        }
+        std::wstring message = L"發現新版本：" + Utf8ToWide(info->tag) + L"\n目前版本：" +
+                               Utf8ToWide(VRFK_VERSION_STRING);
+        if (!notes.empty()) message += L"\n\n更新內容：\n" + notes;
+        message += L"\n\n是：下載、驗證並安裝\n否：開啟 GitHub Release\n取消：稍後再說";
+        const int choice = MessageBoxW(hwnd, message.c_str(), L"VR Full Keyboard 有新版本", MB_ICONINFORMATION | MB_YESNOCANCEL);
+        if (choice == IDYES) {
+            StartUpdateInstallTask(*info);
+        } else if (choice == IDNO && !info->pageUrl.empty()) {
+            const std::wstring url = Utf8ToWide(info->pageUrl);
+            ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        return 0;
+    }
+    case WM_APP_UPDATE_EXIT:
+        g_busy = false;
+        DestroyWindow(hwnd);
+        return 0;
     case WM_APP_TASK_DONE: {
         std::unique_ptr<TaskDone> done(reinterpret_cast<TaskDone*>(lParam));
         SetBusy(false);
@@ -1130,7 +1627,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_CLOSE:
         if (g_busy) {
-            if (MessageBoxW(hwnd, L"目前仍有建置／封裝作業正在執行。\n確定要關閉控制中心嗎？", L"作業進行中", MB_ICONWARNING | MB_YESNO) != IDYES) return 0;
+            if (MessageBoxW(hwnd, L"目前仍有建置／封裝／更新作業正在執行。\n確定要關閉控制中心嗎？", L"作業進行中", MB_ICONWARNING | MB_YESNO) != IDYES) return 0;
         }
         DestroyWindow(hwnd);
         return 0;

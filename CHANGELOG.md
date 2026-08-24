@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.9.0
+- 綁定官方 GitHub Repository：`tw2323123/VRFullKeyboard`。
+- 3.9.0 是第一個具備完整更新器的版本；3.8.6 → 3.9.0 需手動更新一次，之後版本可由控制中心更新。
+- 控制中心「更新與版本」可直接檢查 GitHub Latest Release。
+- 新增自動下載 Windows 分享版 ZIP 與 SHA256。
+- 下載完成後會先驗證 SHA256，驗證失敗不修改現有程式。
+- 新增獨立 `VRFullKeyboardUpdater.exe`，可在控制中心關閉後安全替換 EXE / DLL。
+- 更新前自動備份被覆蓋檔案；套用失敗時嘗試還原。
+- 更新流程明確保護 `VRFullKeyboard.ini`，保留個人設定。
+- 分享版加入 Updater，但仍不需要 Visual Studio / CMake / Git。
+- GitHub Actions 改用現代 FetchContent 寫法並加入 Tag → Release 自動封裝流程。
+
 ## 3.8.6
 - 分享版控制中心精簡為 4 個啟動選項 + 建立桌面捷徑。
 - 分享版隱藏開發工具、資料夾工具與作業記錄區。

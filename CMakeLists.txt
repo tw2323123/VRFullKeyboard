@@ -5,13 +5,6 @@ if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
 
-# CMake 3.30+ emits a developer warning for direct FetchContent_Populate(name).
-# ImGui is consumed as source files rather than as a CMake subproject, so keep
-# the intentional legacy population behavior without noisy bootstrap warnings.
-if(POLICY CMP0169)
-    cmake_policy(SET CMP0169 OLD)
-endif()
-
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" VRFK_VERSION LIMIT_COUNT 1)
 string(STRIP "${VRFK_VERSION}" VRFK_VERSION)
 if(NOT VRFK_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
@@ -20,10 +13,10 @@ endif()
 
 project(VRFullKeyboard VERSION ${VRFK_VERSION} LANGUAGES CXX)
 
-# V3.8 update-check target. Leave blank until the official GitHub repository
-# exists; later releases will hard-code the verified official repository.
-set(VRFK_GITHUB_OWNER "" CACHE STRING "GitHub owner for in-app update checks")
-set(VRFK_GITHUB_REPO "" CACHE STRING "GitHub repository for in-app update checks")
+# Official public update source. Keep these fixed so release builds can only
+# query the verified VR Full Keyboard repository.
+set(VRFK_GITHUB_OWNER "tw2323123")
+set(VRFK_GITHUB_REPO "VRFullKeyboard")
 
 # The native Control Center has no OpenVR/ImGui dependency. Bootstrap builds set
 # this OFF so the first launch needs only MSVC + Windows SDK + CMake, with no Git/network.
@@ -79,35 +72,47 @@ target_link_libraries(VRFullKeyboardControl PRIVATE
     comctl32
     bcrypt
     dwmapi
+    winhttp
+)
+
+# Small native updater. It runs from the downloaded staging directory so it can
+# safely replace the currently installed control center and keyboard binaries.
+add_executable(VRFullKeyboardUpdater WIN32
+    src/updater.cpp
+)
+
+target_compile_definitions(VRFullKeyboardUpdater PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
+if(MSVC)
+    target_compile_options(VRFullKeyboardUpdater PRIVATE /source-charset:utf-8 /execution-charset:utf-8)
+endif()
+
+target_link_libraries(VRFullKeyboardUpdater PRIVATE
+    user32
+    shell32
 )
 
 if(VRFK_BUILD_CORE)
     include(FetchContent)
 
-    # Official OpenVR SDK
-    FetchContent_Declare(
-        openvr
+    # FetchContent_Populate with full population details remains supported on
+    # modern CMake and avoids the deprecated single-argument CMP0169 path.
+    FetchContent_Populate(openvr
         GIT_REPOSITORY https://github.com/ValveSoftware/openvr.git
         GIT_TAG v2.15.6
         GIT_SHALLOW TRUE
     )
-    # We only need the official headers + prebuilt Windows import library/DLL.
-    FetchContent_GetProperties(openvr)
-    if(NOT openvr_POPULATED)
-        FetchContent_Populate(openvr)
-    endif()
 
-    # Dear ImGui for the off-screen keyboard UI
-    FetchContent_Declare(
-        imgui
+    FetchContent_Populate(imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
         GIT_TAG v1.92.9b
         GIT_SHALLOW TRUE
     )
-    FetchContent_GetProperties(imgui)
-    if(NOT imgui_POPULATED)
-        FetchContent_Populate(imgui)
-    endif()
 
     add_executable(VRFullKeyboard WIN32
         src/main.cpp

@@ -4,6 +4,8 @@ VR Full Keyboard
 
 1. 直接執行 VRFullKeyboardControl.exe。
 2. 使用「啟動 VR 鍵盤」、「桌面預覽」或「編輯預覽」。
-3. 不需要 Visual Studio、CMake、Git，也不需要自行編譯。
+3. 「更新與版本」可直接從官方 GitHub Release 檢查並安裝新版。
+4. 不需要 Visual Studio、CMake、Git，也不需要自行編譯。
 
-VRFullKeyboard.ini 會由程式建立並保留；未來更新不應覆蓋個人設定。
+自動更新會先驗證 SHA256，再由獨立更新器替換檔案。
+VRFullKeyboard.ini 不會被更新包覆蓋，個人設定會保留。
