@@ -1,0 +1,42 @@
+name: Windows Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Stage prebuilt package
+        shell: pwsh
+        run: |
+          $dist = "dist/VRFullKeyboard_Windows_x64"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item "build/Release/VRFullKeyboardControl.exe" $dist
+          Copy-Item "build/Release/VRFullKeyboard.exe" $dist
+          Copy-Item "build/Release/openvr_api.dll" $dist
+          Copy-Item "release_files/README.txt" $dist
+          Copy-Item "VERSION" "$dist/VERSION.txt"
+          Compress-Archive -Path "$dist/*" -DestinationPath "dist/VRFullKeyboard_Windows_x64.zip" -Force
+          $h = (Get-FileHash -Algorithm SHA256 "dist/VRFullKeyboard_Windows_x64.zip").Hash.ToLower()
+          Set-Content -Encoding ascii "dist/VRFullKeyboard_Windows_x64.sha256" ($h + "  VRFullKeyboard_Windows_x64.zip")
+
+      - name: Upload prebuilt artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VRFullKeyboard-Windows-x64
+          path: |
+            dist/VRFullKeyboard_Windows_x64.zip
+            dist/VRFullKeyboard_Windows_x64.sha256

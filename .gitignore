@@ -1,0 +1,31 @@
+# Local build / generated front-end
+build/
+.frontend/
+dist/
+
+# User settings
+VRFullKeyboard.ini
+
+# Visual Studio / CMake local files
+.vs/
+CMakeSettings.json
+CMakeUserPresets.json
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Compiler outputs
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
