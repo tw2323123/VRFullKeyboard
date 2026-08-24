@@ -2,7 +2,7 @@
 
 SteamVR virtual full-size keyboard for Windows, with Traditional Chinese / Bopomofo support, Q9/Numpad mode, macros, wrist summon controls, desktop preview, editor preview, and a native Control Center.
 
-Current version: **3.9.5**
+Current version: **3.9.6**
 
 ## Source / developer version
 
@@ -10,7 +10,7 @@ Open `啟動控制中心.cmd`.
 
 The first launch builds only the native Control Center. It requires Visual Studio 2022 C++ tools, Windows SDK, and CMake. Git is only required when building the VR keyboard core because OpenVR and Dear ImGui are fetched for source builds.
 
-The developer Control Center can launch previews, build the core, create the prebuilt share package, inspect logs, and manage build outputs.
+The developer Control Center can launch previews, build the core, create the prebuilt share package, publish GitHub versions, inspect logs, and manage build outputs.
 
 If the project folder is moved or renamed, the Control Center automatically detects a stale CMake cache that points to the old source path, clears only the generated `build` directory, and configures the project again.
 
@@ -37,7 +37,9 @@ The Control Center is bound to the official public repository:
 
 ## Release automation
 
-GitHub Actions builds the Windows package on pushes and pull requests. Pushing a tag such as `v3.9.1` whose value matches `VERSION` also creates/updates the GitHub Release and uploads the ZIP + SHA256 assets automatically.
+Developer builds include **發布 GitHub 新版本** directly in the Control Center. Enter a `MAJOR.MINOR.PATCH` version and confirm once; the Control Center safely stashes local edits, syncs `main`, restores the edits, updates `VERSION`, commits all source changes, pushes `main`, creates the matching annotated tag, and pushes it. GitHub Actions then builds the Windows package and creates the GitHub Release with ZIP + SHA256 assets.
+
+The publisher requires Git for Windows and must be run from the real Git repository on the `main` branch. It refuses duplicate tags and stops on merge/stash conflicts instead of overwriting local source.
 
 ## Update reliability test
 

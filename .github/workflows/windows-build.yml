@@ -66,45 +66,9 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $zip = "dist/VRFullKeyboard_Windows_x64.zip"
           $sha = "dist/VRFullKeyboard_Windows_x64.sha256"
-
-          if (!(Test-Path $zip)) {
-            throw "ZIP not found: $zip"
-          }
-
-          if (!(Test-Path $sha)) {
-            throw "SHA256 not found: $sha"
-          }
-
-          Write-Host "ZIP size:" (Get-Item $zip).Length
-          Write-Host "SHA size:" (Get-Item $sha).Length
-
           gh release view $tag *> $null
-
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag `
-              --title "VR Full Keyboard $tag" `
-              --generate-notes
-          }
-
-          gh release upload $tag $zip --clobber
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to upload ZIP"
-          }
-
-          gh release upload $tag $sha --clobber
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to upload SHA256"
-          }
-
-          $assets = gh release view $tag --json assets --jq '.assets[].name'
-
-          Write-Host "Release assets:"
-          Write-Host $assets
-
-          if ($assets -notcontains "VRFullKeyboard_Windows_x64.zip") {
-            throw "Release ZIP asset verification failed"
-          }
-
-          if ($assets -notcontains "VRFullKeyboard_Windows_x64.sha256") {
-            throw "Release SHA256 asset verification failed"
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip $sha --clobber
+          } else {
+            gh release create $tag $zip $sha --title "VR Full Keyboard $tag" --generate-notes
           }

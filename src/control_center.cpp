@@ -49,6 +49,7 @@ constexpr int IDC_BUILD = 1201;
 constexpr int IDC_PACKAGE = 1202;
 constexpr int IDC_CLEAN = 1203;
 constexpr int IDC_OPEN_OUTPUT = 1204;
+constexpr int IDC_PUBLISH_GITHUB = 1205;
 constexpr int IDC_OPEN_ROOT = 1301;
 constexpr int IDC_SHORTCUT = 1302;
 constexpr int IDC_OPEN_LOG = 1303;
@@ -58,9 +59,15 @@ constexpr int IDC_LOG_TOGGLE = 1402;
 constexpr int IDC_LOG_CLEAR = 1403;
 constexpr int IDC_LOG_COPY = 1404;
 
+constexpr int IDC_RELEASE_VERSION = 2101;
+constexpr int IDC_RELEASE_CONFIRM = 2102;
+constexpr int IDC_RELEASE_CANCEL = 2103;
+constexpr wchar_t kReleaseDialogClass[] = L"VRFullKeyboardReleaseDialogClass";
+
 struct TaskDone {
     bool success = false;
     int pendingLaunch = 0;
+    bool offerActions = false;
     std::wstring summary;
 };
 
@@ -87,6 +94,8 @@ HFONT g_smallFont = nullptr;
 HFONT g_titleFont = nullptr;
 HFONT g_logFont = nullptr;
 HBRUSH g_logBrush = nullptr;
+HBRUSH g_releaseEditBrush = nullptr;
+HWND g_releaseDialog = nullptr;
 std::atomic_bool g_busy{false};
 std::atomic_bool g_updateCheckBusy{false};
 fs::path g_root;
@@ -105,6 +114,8 @@ std::unordered_set<HWND> g_hoverButtons;
 
 void SetLogExpanded(bool expanded);
 void Layout(HWND hwnd);
+void StartPublishTask(const std::wstring& version);
+void ShowReleaseDialog();
 
 std::wstring Utf8ToWide(const std::string& text) {
     if (text.empty()) return {};
@@ -129,6 +140,39 @@ std::string WideToUtf8(const std::wstring& text) {
     std::string out((size_t)len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), out.data(), len, nullptr, nullptr);
     return out;
+}
+
+std::wstring TrimWide(std::wstring value) {
+    auto notSpace = [](wchar_t ch) { return !iswspace(ch); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
+    value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
+    return value;
+}
+
+bool IsSemVer(const std::wstring& value) {
+    if (value.empty()) return false;
+    int partCount = 0;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t dot = value.find(L'.', start);
+        const size_t end = (dot == std::wstring::npos) ? value.size() : dot;
+        if (end == start) return false;
+        for (size_t i = start; i < end; ++i) {
+            if (!iswdigit(value[i])) return false;
+        }
+        ++partCount;
+        if (dot == std::wstring::npos) break;
+        start = dot + 1;
+    }
+    return partCount == 3;
+}
+
+bool WriteVersionFile(const std::wstring& version) {
+    std::ofstream out(g_root / L"VERSION", std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    const std::string utf8 = WideToUtf8(version + L"\n");
+    out.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+    return out.good();
 }
 
 std::wstring Quote(const std::wstring& value) {
@@ -299,7 +343,8 @@ void RefreshStatus() {
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-int RunProcessCapture(const fs::path& exe, const std::vector<std::wstring>& args, const fs::path& cwd) {
+int RunProcessCapture(const fs::path& exe, const std::vector<std::wstring>& args, const fs::path& cwd,
+                      std::wstring* captured = nullptr, bool echoOutput = true) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE readPipe = nullptr;
     HANDLE writePipe = nullptr;
@@ -334,7 +379,9 @@ int RunProcessCapture(const fs::path& exe, const std::vector<std::wstring>& args
     char buffer[4096];
     DWORD read = 0;
     while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
-        PostLog(Utf8ToWide(std::string(buffer, buffer + read)));
+        const std::wstring chunk = Utf8ToWide(std::string(buffer, buffer + read));
+        if (captured) *captured += chunk;
+        if (echoOutput) PostLog(chunk);
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -1076,6 +1123,158 @@ void StartPackageTask() {
     }).detach();
 }
 
+void StartPublishTask(const std::wstring& version) {
+    if (!IsSemVer(version)) {
+        MessageBoxW(g_hwnd, L"版本格式不正確。", L"無法發布", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    if (g_busy.exchange(true)) return;
+
+    SetLogExpanded(true);
+    SetBusy(true);
+    const std::wstring tag = L"v" + version;
+    AppendLog(L"\r\n==============================\r\n發布 GitHub 新版本 " + tag +
+              L"\r\n==============================\r\n");
+
+    std::thread([version, tag]() {
+        TaskDone done;
+        const fs::path git = FindGit();
+        if (git.empty()) {
+            done.summary = L"找不到 Git for Windows。";
+            if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(new TaskDone(done)));
+            return;
+        }
+        if (!fs::exists(g_root / L".git")) {
+            done.summary = L"找不到 .git，目前資料夾不是可發布的 Git Repository。";
+            if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(new TaskDone(done)));
+            return;
+        }
+
+        auto runGit = [&](const std::vector<std::wstring>& args, std::wstring* output = nullptr, bool echo = true) -> int {
+            if (output) output->clear();
+            return RunProcessCapture(git, args, g_root, output, echo);
+        };
+        auto finish = [&](bool success, const std::wstring& summary, bool offerActions = false) {
+            done.success = success;
+            done.offerActions = offerActions;
+            done.summary = summary;
+            if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(new TaskDone(done)));
+        };
+
+        PostLog(L"[1/7] 檢查 main 分支與 Tag...\r\n");
+        std::wstring branch;
+        if (runGit({L"branch", L"--show-current"}, &branch, false) != 0) {
+            finish(false, L"無法讀取目前 Git 分支。");
+            return;
+        }
+        branch = TrimWide(branch);
+        if (branch != L"main") {
+            finish(false, L"目前分支是「" + branch + L"」，請切換到 main 後再發布。");
+            return;
+        }
+        if (runGit({L"fetch", L"origin", L"--tags"}) != 0) {
+            finish(false, L"無法從 GitHub 同步 Tag。");
+            return;
+        }
+        if (runGit({L"rev-parse", L"-q", L"--verify", L"refs/tags/" + tag}, nullptr, false) == 0) {
+            finish(false, L"Tag " + tag + L" 已存在，請改用新的版本號。");
+            return;
+        }
+
+        PostLog(L"\r\n[2/7] 暫存本機尚未提交的修改...\r\n");
+        std::wstring status;
+        if (runGit({L"status", L"--porcelain"}, &status, false) != 0) {
+            finish(false, L"無法讀取 Git 工作目錄狀態。");
+            return;
+        }
+        bool stashed = !TrimWide(status).empty();
+        const std::wstring stashName = L"VRFK_RELEASE_TEMP_" + std::to_wstring(GetTickCount64());
+        if (stashed) {
+            PostLog(L"偵測到本機 Source 修改：\r\n" + status);
+            if (runGit({L"stash", L"push", L"-u", L"-m", stashName}) != 0) {
+                finish(false, L"暫存本機修改失敗；Source 沒有被發布。 ");
+                return;
+            }
+            PostLog(L"本機修改已安全暫存。\r\n");
+        } else {
+            PostLog(L"目前沒有未提交修改。\r\n");
+        }
+
+        PostLog(L"\r\n[3/7] 同步 GitHub main...\r\n");
+        if (runGit({L"pull", L"--rebase", L"origin", L"main"}) != 0) {
+            if (stashed) {
+                PostLog(L"同步失敗，正在還原暫存內容...\r\n");
+                runGit({L"stash", L"pop"});
+            }
+            finish(false, L"git pull --rebase 失敗；已停止發布。請查看作業記錄。");
+            return;
+        }
+
+        if (stashed) {
+            PostLog(L"正在還原本機開發內容...\r\n");
+            if (runGit({L"stash", L"pop"}) != 0) {
+                finish(false, L"GitHub 最新內容與本機修改發生衝突。修改與 stash 仍由 Git 保留，請先解決衝突後再發布。");
+                return;
+            }
+            stashed = false;
+        }
+
+        PostLog(L"\r\n[4/7] 設定 VERSION = " + version + L"...\r\n");
+        if (!WriteVersionFile(version)) {
+            finish(false, L"無法寫入 VERSION 檔案。");
+            return;
+        }
+
+        status.clear();
+        if (runGit({L"status", L"--porcelain"}, &status, false) != 0) {
+            finish(false, L"無法取得發布前 Git 狀態。");
+            return;
+        }
+        if (!TrimWide(status).empty()) {
+            PostLog(L"即將提交：\r\n" + status);
+            if (runGit({L"add", L"-A"}) != 0) {
+                finish(false, L"git add 失敗；尚未建立 Release Commit。");
+                return;
+            }
+            if (runGit({L"commit", L"-m", L"Release " + tag}) != 0) {
+                finish(false, L"建立 Release Commit 失敗，請查看作業記錄。");
+                return;
+            }
+        } else {
+            PostLog(L"Source 沒有新的檔案差異，將目前 HEAD 直接發布為 " + tag + L"。\r\n");
+        }
+
+        std::wstring headVersion;
+        if (runGit({L"show", L"HEAD:VERSION"}, &headVersion, false) != 0 || TrimWide(headVersion) != version) {
+            finish(false, L"安全檢查失敗：HEAD 中的 VERSION 與要發布的版本不一致。");
+            return;
+        }
+
+        PostLog(L"\r\n[5/7] Push main...\r\n");
+        if (runGit({L"push", L"origin", L"main"}) != 0) {
+            finish(false, L"Push main 失敗。Release Commit 仍保留在本機，可修正連線後重新發布。");
+            return;
+        }
+
+        PostLog(L"\r\n[6/7] 建立並 Push " + tag + L"...\r\n");
+        if (runGit({L"tag", L"-a", tag, L"-m", L"VR Full Keyboard " + tag}) != 0) {
+            finish(false, L"建立 Tag 失敗。");
+            return;
+        }
+        if (runGit({L"push", L"origin", tag}) != 0) {
+            PostLog(L"Tag Push 失敗，移除本機 Tag 以便安全重試...\r\n");
+            runGit({L"tag", L"-d", tag}, nullptr, false);
+            finish(false, L"Push Tag 失敗；main 已推送，但本機 Tag 已移除，可直接重新發布同一版本。");
+            return;
+        }
+
+        PostLog(L"\r\n[7/7] 完成。GitHub Actions 已接手建置 Release。\r\n");
+        finish(true,
+               tag + L" 已推送至 GitHub。\n\nGitHub Actions 接下來會自動建置 Windows 分享版、ZIP、SHA256 與 Release。\n控制中心下次啟動時會依新的 VERSION 自動重建。",
+               true);
+    }).detach();
+}
+
 void OpenFolder(const fs::path& path) {
     fs::path target = path;
     if (!fs::exists(target)) target = g_root;
@@ -1216,7 +1415,8 @@ ButtonVisual GetButtonVisual(int id) {
     case IDC_EDITOR: return {L"編輯預覽", L"調整外觀、位置、快捷鍵與九方模式", ButtonTone::Secondary};
     case IDC_UPDATE: return {L"更新與版本", g_updateButtonSubtitle.c_str(), g_updateAvailableHint ? ButtonTone::Primary : ButtonTone::Accent};
     case IDC_BUILD: return {L"建置最新版", L"編譯 VRFullKeyboard.exe", ButtonTone::Secondary};
-    case IDC_PACKAGE: return {L"建立分享版", L"產生免建置 ZIP 與 SHA256", ButtonTone::Primary};
+    case IDC_PACKAGE: return {L"建立分享版", L"自動建置並產生 ZIP 與 SHA256", ButtonTone::Primary};
+    case IDC_PUBLISH_GITHUB: return {L"發布 GitHub 新版本", L"提交、推送、Tag，自動建立 Release", ButtonTone::Accent};
     case IDC_CLEAN: return {L"清除建置快取", L"刪除 build，不動設定與發行包", ButtonTone::Danger};
     case IDC_OPEN_OUTPUT: return {L"開啟程式位置", L"定位目前建置完成的核心程式", ButtonTone::Utility};
     case IDC_OPEN_ROOT: return {g_developerMode ? L"專案資料夾" : L"程式資料夾", L"在檔案總管開啟目前資料夾", ButtonTone::Utility};
@@ -1308,6 +1508,174 @@ HWND MakeButton(HWND parent, int id, const wchar_t* text = L"") {
     SetWindowSubclass(h, ButtonSubclassProc, 1, 0);
     g_allButtons.push_back(h);
     return h;
+}
+
+void CloseReleaseDialog(HWND hwnd) {
+    HWND owner = GetWindow(hwnd, GW_OWNER);
+    g_releaseDialog = nullptr;
+    DestroyWindow(hwnd);
+    if (owner && IsWindow(owner)) {
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+    }
+}
+
+LRESULT CALLBACK ReleaseDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        const UINT dpi = WindowDpi(g_hwnd ? g_hwnd : hwnd);
+        BOOL dark = TRUE;
+        constexpr DWORD kImmersiveDarkMode = 20;
+        DwmSetWindowAttribute(hwnd, kImmersiveDarkMode, &dark, sizeof(dark));
+
+        const int left = ScaleForDpi(24, dpi);
+        const int width = ScaleForDpi(472, dpi);
+        const int labelH = ScaleForDpi(24, dpi);
+
+        HWND title = CreateWindowExW(0, L"STATIC", L"發布 GitHub 新版本",
+            WS_CHILD | WS_VISIBLE, left, ScaleForDpi(22, dpi), width, labelH,
+            hwnd, nullptr, g_instance, nullptr);
+        SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+        std::wstring current = TrimWide(ReadTextFile(g_root / L"VERSION"));
+        if (current.empty()) current = Utf8ToWide(VRFK_VERSION_STRING);
+        std::wstring currentText = L"目前 Source VERSION：" + current;
+        HWND currentLabel = CreateWindowExW(0, L"STATIC", currentText.c_str(),
+            WS_CHILD | WS_VISIBLE, left, ScaleForDpi(52, dpi), width, labelH,
+            hwnd, nullptr, g_instance, nullptr);
+        SendMessageW(currentLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_smallFont), TRUE);
+
+        HWND versionLabel = CreateWindowExW(0, L"STATIC", L"要發布的版本號",
+            WS_CHILD | WS_VISIBLE, left, ScaleForDpi(84, dpi), width, labelH,
+            hwnd, nullptr, g_instance, nullptr);
+        SendMessageW(versionLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", current.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            left, ScaleForDpi(112, dpi), width, ScaleForDpi(34, dpi),
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RELEASE_VERSION)), g_instance, nullptr);
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+
+        HWND info = CreateWindowExW(0, L"STATIC",
+            L"會自動暫存未提交修改、同步 GitHub main、還原修改、更新 VERSION、提交全部 Source、Push main、建立 Tag，再交給 GitHub Actions 建立 Release。",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            left, ScaleForDpi(158, dpi), width, ScaleForDpi(58, dpi),
+            hwnd, nullptr, g_instance, nullptr);
+        SendMessageW(info, WM_SETFONT, reinterpret_cast<WPARAM>(g_smallFont), TRUE);
+
+        HWND confirm = CreateWindowExW(0, L"BUTTON", L"開始發布",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            left + ScaleForDpi(250, dpi), ScaleForDpi(232, dpi), ScaleForDpi(106, dpi), ScaleForDpi(36, dpi),
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RELEASE_CONFIRM)), g_instance, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            left + ScaleForDpi(366, dpi), ScaleForDpi(232, dpi), ScaleForDpi(106, dpi), ScaleForDpi(36, dpi),
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RELEASE_CANCEL)), g_instance, nullptr);
+        SendMessageW(confirm, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+        SetFocus(edit);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_RELEASE_CONFIRM: {
+            wchar_t buffer[64]{};
+            GetDlgItemTextW(hwnd, IDC_RELEASE_VERSION, buffer, static_cast<int>(std::size(buffer)));
+            const std::wstring version = TrimWide(buffer);
+            if (!IsSemVer(version)) {
+                MessageBoxW(hwnd, L"版本格式必須是 MAJOR.MINOR.PATCH，例如 3.9.6。",
+                            L"版本格式不正確", MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+            const std::wstring tag = L"v" + version;
+            std::wstring message = L"確定要將目前所有未提交的 Source 變更發布為 " + tag + L"？\n\n"
+                                   L"控制中心會自動同步 main、Commit、Push、建立 Tag，接著由 GitHub Actions 建立 ZIP、SHA256 與 Release。";
+            if (MessageBoxW(hwnd, message.c_str(), L"確認發布", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+                return 0;
+            }
+            CloseReleaseDialog(hwnd);
+            StartPublishTask(version);
+            return 0;
+        }
+        case IDC_RELEASE_CANCEL:
+            CloseReleaseDialog(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, kText);
+        SetBkMode(dc, TRANSPARENT);
+        return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, kText);
+        SetBkColor(dc, kCard);
+        return reinterpret_cast<INT_PTR>(g_releaseEditBrush ? g_releaseEditBrush : GetStockObject(BLACK_BRUSH));
+    }
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        HBRUSH brush = CreateSolidBrush(kBg);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    case WM_CLOSE:
+        CloseReleaseDialog(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (g_releaseDialog == hwnd) g_releaseDialog = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ShowReleaseDialog() {
+    if (!g_developerMode) return;
+    if (g_busy) {
+        MessageBoxW(g_hwnd, L"目前已有其他作業正在執行，請完成後再發布。",
+                    L"VR Full Keyboard", MB_ICONINFORMATION | MB_OK);
+        return;
+    }
+    if (FindGit().empty()) {
+        MessageBoxW(g_hwnd, L"找不到 Git。發布 GitHub 版本需要 Git for Windows。",
+                    L"無法發布", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    if (!fs::exists(g_root / L".git")) {
+        MessageBoxW(g_hwnd, L"目前資料夾不是 Git Repository，找不到 .git。",
+                    L"無法發布", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    if (g_releaseDialog && IsWindow(g_releaseDialog)) {
+        SetForegroundWindow(g_releaseDialog);
+        return;
+    }
+
+    const UINT dpi = WindowDpi(g_hwnd);
+    const int width = ScaleForDpi(520, dpi);
+    const int height = ScaleForDpi(316, dpi);
+    RECT owner{};
+    GetWindowRect(g_hwnd, &owner);
+    const int x = owner.left + ((owner.right - owner.left) - width) / 2;
+    const int y = owner.top + ((owner.bottom - owner.top) - height) / 2;
+
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        kReleaseDialogClass, L"發布 GitHub 新版本",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, width, height, g_hwnd, nullptr, g_instance, nullptr);
+    if (!dialog) {
+        MessageBoxW(g_hwnd, L"無法建立發布視窗。", L"VR Full Keyboard", MB_ICONERROR | MB_OK);
+        return;
+    }
+    g_releaseDialog = dialog;
+    EnableWindow(g_hwnd, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
 }
 
 void SetLogExpanded(bool expanded) {
@@ -1493,7 +1861,7 @@ void Layout(HWND hwnd) {
 
     placeRow(lm.launchCard, {IDC_RUN_VR, IDC_PREVIEW, IDC_EDITOR, IDC_UPDATE}, ScaleForDpi(70, dpi));
     if (g_developerMode) {
-        placeRow(lm.devCard, {IDC_BUILD, IDC_PACKAGE, IDC_CLEAN, IDC_OPEN_OUTPUT}, ScaleForDpi(58, dpi));
+        placeRow(lm.devCard, {IDC_BUILD, IDC_PACKAGE, IDC_PUBLISH_GITHUB, IDC_CLEAN, IDC_OPEN_OUTPUT}, ScaleForDpi(58, dpi));
         placeRow(lm.toolsCard, {IDC_OPEN_ROOT, IDC_OPEN_LOG, IDC_ROLLBACK_TEST, IDC_SHORTCUT}, ScaleForDpi(50, dpi));
 
         const int actionW = ScaleForDpi(104, dpi);
@@ -1591,6 +1959,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_developerMode) {
             g_taskButtons.push_back(MakeButton(hwnd, IDC_BUILD));
             g_taskButtons.push_back(MakeButton(hwnd, IDC_PACKAGE));
+            g_taskButtons.push_back(MakeButton(hwnd, IDC_PUBLISH_GITHUB));
             g_taskButtons.push_back(MakeButton(hwnd, IDC_CLEAN));
             g_taskButtons.push_back(MakeButton(hwnd, IDC_OPEN_OUTPUT));
         }
@@ -1695,6 +2064,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         case IDC_PACKAGE: StartPackageTask(); break;
+        case IDC_PUBLISH_GITHUB: ShowReleaseDialog(); break;
         case IDC_CLEAN: CleanBuildCache(); break;
         case IDC_OPEN_OUTPUT: OpenOutput(); break;
         case IDC_OPEN_ROOT: OpenFolder(g_root); break;
@@ -1817,15 +2187,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_updateButtonSubtitle = L"更新失敗，可點此重試";
                 if (HWND update = GetDlgItem(hwnd, IDC_UPDATE)) InvalidateRect(update, nullptr, TRUE);
             }
-            if (!done->success) MessageBoxW(hwnd, done->summary.c_str(), L"作業未完成", MB_ICONWARNING);
-            else if (done->pendingLaunch != 0) LaunchCore((PendingLaunch)done->pendingLaunch);
-            else MessageBoxW(hwnd, done->summary.c_str(), L"完成", MB_ICONINFORMATION);
+            if (!done->success) {
+                MessageBoxW(hwnd, done->summary.c_str(), L"作業未完成", MB_ICONWARNING);
+            } else if (done->pendingLaunch != 0) {
+                LaunchCore((PendingLaunch)done->pendingLaunch);
+            } else if (done->offerActions) {
+                std::wstring message = done->summary + L"\n\n要開啟 GitHub Actions 頁面嗎？";
+                if (MessageBoxW(hwnd, message.c_str(), L"GitHub 發布已送出", MB_ICONINFORMATION | MB_YESNO) == IDYES) {
+                    ShellExecuteW(hwnd, L"open", L"https://github.com/tw2323123/VRFullKeyboard/actions", nullptr, nullptr, SW_SHOWNORMAL);
+                }
+            } else {
+                MessageBoxW(hwnd, done->summary.c_str(), L"完成", MB_ICONINFORMATION);
+            }
         }
         return 0;
     }
     case WM_CLOSE:
         if (g_busy) {
-            if (MessageBoxW(hwnd, L"目前仍有建置／封裝／更新作業正在執行。\n確定要關閉控制中心嗎？", L"作業進行中", MB_ICONWARNING | MB_YESNO) != IDYES) return 0;
+            if (MessageBoxW(hwnd, L"目前仍有建置／封裝／發布／更新作業正在執行。\n確定要關閉控制中心嗎？", L"作業進行中", MB_ICONWARNING | MB_YESNO) != IDYES) return 0;
         }
         DestroyWindow(hwnd);
         return 0;
@@ -1890,6 +2269,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     InitCommonControlsEx(&icc);
 
     g_logBrush = CreateSolidBrush(kLogBg);
+    g_releaseEditBrush = CreateSolidBrush(kCard);
 
     const wchar_t* cls = L"VRFullKeyboardControlCenterClass";
     WNDCLASSEXW wc{sizeof(wc)};
@@ -1900,6 +2280,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.hbrBackground = nullptr;
     wc.lpszClassName = cls;
     RegisterClassExW(&wc);
+
+    WNDCLASSEXW releaseWc{sizeof(releaseWc)};
+    releaseWc.lpfnWndProc = ReleaseDialogProc;
+    releaseWc.hInstance = hInstance;
+    releaseWc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    releaseWc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    releaseWc.hbrBackground = nullptr;
+    releaseWc.lpszClassName = kReleaseDialogClass;
+    RegisterClassExW(&releaseWc);
 
     const int initialWidth = g_developerMode ? 1120 : 980;
     const int initialHeight = g_developerMode ? 760 : 500;
@@ -1921,6 +2310,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (g_releaseDialog && IsWindow(g_releaseDialog) && IsDialogMessageW(g_releaseDialog, &msg)) continue;
         if (!IsDialogMessageW(g_hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -1928,6 +2318,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     }
 
     if (g_logBrush) DeleteObject(g_logBrush);
+    if (g_releaseEditBrush) DeleteObject(g_releaseEditBrush);
     if (g_font) DeleteObject(g_font);
     if (g_smallFont) DeleteObject(g_smallFont);
     if (g_titleFont) DeleteObject(g_titleFont);

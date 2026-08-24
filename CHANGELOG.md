@@ -1,9 +1,21 @@
 # Changelog
 
+## 3.9.6
+
+- 開發版控制中心新增「發布 GitHub 新版本」。
+- 發布視窗可直接輸入版本號並在送出前二次確認。
+- 發布流程內建安全同步：暫存未提交修改 → pull --rebase → 還原修改 → 更新 VERSION。
+- 自動 Commit、Push main、建立 annotated Tag 並 Push Tag，之後交由 GitHub Actions 建立 ZIP、SHA256 與 Release。
+- 發布前檢查 main 分支、Git、.git Repository、版本格式與重複 Tag。
+- Tag Push 失敗時會移除本機新建 Tag，讓同一版本可安全重試。
+- 「建立分享版」說明改為明確表示會自動建置最新版再產生 ZIP / SHA256。
+- 發布功能完全整合在 control_center.cpp，不需要額外 PowerShell / CMD 發布腳本。
+
 ## 3.9.5
 
 - 修正編輯預覽中文字按鈕在部分 DPI / 微軟正黑體下視覺基線偏低的問題。
-- 編輯器按鈕文字改為獨立的向上微調對齊，不影響 VR 鍵盤本體鍵帽。
+- 編輯器全寬按鈕改為自訂垂直置中文字繪製，不再依賴 ImGui 中文字型 baseline。
+- 不影響 VR 鍵盤本體鍵帽，並保留 Hover、Active、Click、Border 與圓角行為。
 - 保留 V3.9.3 的裁切修正、UI 間距解耦與自動儲存 I/O 優化。
 
 ## 3.9.3
@@ -75,9 +87,3 @@
 - Decoupled Control Center bootstrap build from OpenVR/ImGui fetching.
 - Fixed bootstrap compiler warnings.
 - Clarified source/developer build versus prebuilt share package behavior.
-
-
-## 3.9.5
-- Replaced editor full-width button labels with custom vertically-centered drawing.
-- Removes dependency on ImGui button baseline metrics for Traditional Chinese labels.
-- Keeps normal hover, active, click, border and rounded-corner behavior.
