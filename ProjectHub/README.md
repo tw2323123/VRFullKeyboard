@@ -11,7 +11,7 @@
 
 ## 目前最新開發主線
 
-**Alpha V3.9.10 Test Build 03 — Overlay Interaction Integration**
+**Alpha V3.9.11 Test Build 03 — TEST13 Validated Mainline**
 
 這個測試版：
 - 以 V3.9.9 的低延遲迴圈為基礎

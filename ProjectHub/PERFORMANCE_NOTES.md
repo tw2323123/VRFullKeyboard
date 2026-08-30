@@ -2,7 +2,7 @@
 
 ## Current baseline
 
-**Alpha V3.9.10 Test Build 03**
+**Alpha V3.9.11 Test Build 03**
 
 TB03 preserves the TB02 default timing behavior:
 

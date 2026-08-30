@@ -31,10 +31,10 @@
 ## Version separation
 
 ### Current development
-Alpha V3.9.10 Test Build 03
+Alpha V3.9.11 Test Build 03
 
 Sources of truth:
-- `VERSION` → SemVer (`3.9.10`)
+- `VERSION` → SemVer (`3.9.11`)
 - `TEST_BUILD` → development build identity (`03`)
 - Control Center bootstrap cache key → `<VERSION>-TB<TEST_BUILD>`
 
@@ -56,4 +56,4 @@ Sources of truth:
 
 例如：
 
-`Alpha V3.9.10 Test Build 03 (abc1234, 2026-08-25)`
+`Alpha V3.9.11 Test Build 03 (abc1234, 2026-08-25)`

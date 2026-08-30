@@ -1,3 +1,14 @@
+# Alpha V3.9.11 TB03 — TEST13 Stabilized Mainline
+
+## 已驗證修正
+- TEST13 Dashboard Grip Bypass 已完成 Valve Index / Knuckles 實機驗證。
+- SteamVR Dashboard 開啟時可 Grip 抓取手腕圓點與完整鍵盤。
+- Dashboard 關閉後既有 Trigger、Grip、Pointer、發光同步與特殊鍵單次輸入無 regression。
+- 控制中心 GitHub Repository 修復流程已驗證。
+- 控制中心 0.5 秒監測造成的頻繁閃爍已修復。
+- 桌面預覽統一恢復 Microsoft JhengHei，修正 ImGui 隱藏 ID (`##` / `###`) 被自繪文字顯示的問題。
+- Source 更新時會自動判定 Core EXE / Control Center 已過期並要求或執行重新建置，避免覆蓋 Source 後誤啟動舊執行檔。
+
 # Alpha V3.9.10 TB03 — Knuckles Grip VALIDATED
 
 ## SteamVR 實測通過

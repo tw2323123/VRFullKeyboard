@@ -4,9 +4,9 @@ Last organized: 2026-08-26
 
 ## Current Development Mainline
 
-**Alpha V3.9.10 Test Build 03 — Knuckles Grip VALIDATED**
+**Alpha V3.9.11 Test Build 03 — TEST13 VALIDATED**
 
-正式版本號仍是 **3.9.10**；Test Build 維持 **03**。
+正式版本號已推進至 **3.9.11**；Test Build 維持 **03**。
 
 ## Validated decisions
 

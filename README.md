@@ -1,6 +1,6 @@
-# Alpha V3.9.10 · Test Build 03
+# Alpha V3.9.11 · Test Build 03
 
-本測試分支以 V3.9.9 的即時手感為基準，保留 Test Build 02 的手腕單一輸入修正，並在既有原生 C++／OpenVR 架構內加入更完整的 VR 懸浮視窗互動。正式 SemVer 仍維持 3.9.10。
+本測試分支以 V3.9.9 的即時手感為基準，保留 Test Build 02 的手腕單一輸入修正，並在既有原生 C++／OpenVR 架構內加入更完整的 VR 懸浮視窗互動。正式 SemVer 已推進至 3.9.11。
 
 ## TB03 已驗證基準
 
@@ -10,7 +10,7 @@ Valve Index / Knuckles 已完成 SteamVR 實測：一般模式可直接抓取鍵
 
 SteamVR virtual full-size keyboard for Windows, with Traditional Chinese / Bopomofo support, Q9/Numpad mode, macros, wrist summon controls, desktop preview, editor preview, and a native Control Center.
 
-Current version: **3.9.10**
+Current version: **3.9.11**
 
 Development test identity is read from **TEST_BUILD**. The launcher includes it in the Control Center cache key, so advancing a Test Build without changing SemVer still forces the correct native front end to rebuild.
 

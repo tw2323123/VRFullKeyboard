@@ -72,7 +72,7 @@ Regression test。
 
 整合核對：原統整包與 `VRFullKeyboard_wristfix.zip` 內的 `src/main.cpp` 位元完全相同；本次主要完成版本識別與 ProjectHub 交接更新。尚待 Windows 建置及 VR 實機回歸。
 
-## Current — Alpha V3.9.10 Test Build 03
+## Current — Alpha V3.9.11 Test Build 03
 
 在 TB02 基準上加入 overlay interaction layer：
 
@@ -96,6 +96,6 @@ Regression test。
 
 目前專案主線以：
 
-**Alpha V3.9.10 Test Build 03**
+**Alpha V3.9.11 Test Build 03**
 
 為準。

@@ -8,7 +8,7 @@ V3.9.9 immediate pose/input loop
 + V4.0.1 diagnostics / CSV
 + TB02 wrist single-input arbitration
 + TB03 overlay interaction layer
-= Alpha V3.9.10 Test Build 03
+= Alpha V3.9.11 Test Build 03
 ```
 
 ## Stack

@@ -14,4 +14,4 @@ Adaptive texture updates are opt-in. The validated low-latency baseline keeps th
 
 ## Version identity
 
-Current development identity: **Alpha V3.9.10 Test Build 03 — Knuckles Grip VALIDATED**.
+Current development identity: **Alpha V3.9.11 Test Build 03 — TEST13 VALIDATED**.

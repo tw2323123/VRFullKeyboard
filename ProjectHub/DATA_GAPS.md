@@ -20,7 +20,7 @@
 目前摘要不足，待從新對話原文補。
 
 ### Latest hands-on regression result
-Alpha V3.9.10 Test Build 03 已整合 overlay interaction layer，
+Alpha V3.9.11 Test Build 03 已整合並驗證 TEST13 overlay interaction layer，
 但尚未有 Windows 重新建置與 VR 實機回歸結果。
 
 ### Controller runtime coverage

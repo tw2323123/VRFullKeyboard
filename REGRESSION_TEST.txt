@@ -1,4 +1,4 @@
-Alpha V3.9.10 / Test Build 03 — Knuckles Grip VALIDATED
+Alpha V3.9.11 / Test Build 03 — TEST13 VALIDATED
 
 已通過的 SteamVR 基準（Valve Index / Knuckles）：
 1. Windows/MSVC Release 建置成功。

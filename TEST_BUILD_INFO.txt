@@ -1,5 +1,5 @@
 VR Full Keyboard
-Alpha V3.9.10 · Test Build 03
+Alpha V3.9.11 · Test Build 03
 
 Overlay interaction integration
 - Normal mode hides placement controls.

@@ -106,14 +106,16 @@ fs::path g_root;
 fs::path g_persistentLogPath;
 bool g_developerMode = false;
 bool g_coreReady = false;
+bool g_coreOutdated = false;
 bool g_cmakeReady = false;
 bool g_gitReady = false;
 bool g_logExpanded = false;
 bool g_updateAvailableHint = false;
 std::wstring g_updateAvailableTag;
 std::wstring g_updateButtonSubtitle = L"檢查 GitHub、驗證並安裝新版";
-constexpr wchar_t kControlExitEventName[] = L"Local\\VRFullKeyboard.Exit.AlphaV3_9_10";
+constexpr wchar_t kControlExitEventName[] = L"Local\\VRFullKeyboard.Exit.AlphaV3_9_11";
 bool g_coreRunning = false;
+RECT g_perfPaintRect{0, 0, 0, 0};
 struct PerfSnapshot {
     bool valid = false;
     float cpuPercent = 0.0f;
@@ -224,6 +226,33 @@ fs::path DetectRoot() {
 fs::path CoreExePath() {
     if (g_developerMode) return g_root / L"build" / L"Release" / L"VRFullKeyboard.exe";
     return g_root / L"VRFullKeyboard.exe";
+}
+
+bool IsCoreBuildOutdated(std::wstring* newerSource = nullptr) {
+    if (!g_developerMode) return false;
+    const fs::path exe = CoreExePath();
+    std::error_code ec;
+    if (!fs::exists(exe, ec)) return false;
+    const auto exeTime = fs::last_write_time(exe, ec);
+    if (ec) return false;
+
+    const fs::path inputs[] = {
+        g_root / L"src" / L"main.cpp",
+        g_root / L"CMakeLists.txt",
+        g_root / L"VERSION",
+        g_root / L"TEST_BUILD",
+        g_root / L"cmake" / L"VRFullKeyboardVersion.h.in",
+    };
+    for (const auto& input : inputs) {
+        ec.clear();
+        if (!fs::exists(input, ec) || ec) continue;
+        const auto inputTime = fs::last_write_time(input, ec);
+        if (!ec && inputTime > exeTime) {
+            if (newerSource) *newerSource = input.lexically_relative(g_root).wstring();
+            return true;
+        }
+    }
+    return false;
 }
 
 fs::path OpenVrDllPath() {
@@ -346,13 +375,13 @@ void AppendLog(const std::wstring& text) {
 fs::path PerfReportPath() {
     const std::wstring local = EnvValue(L"LOCALAPPDATA");
     fs::path base = local.empty() ? g_root : fs::path(local);
-    return base / L"VRFullKeyboard" / L"logs" / L"perf_alpha_v3_9_10.csv";
+    return base / L"VRFullKeyboard" / L"logs" / L"perf_alpha_v3_9_11.csv";
 }
 
 fs::path PerfLivePath() {
     const std::wstring local = EnvValue(L"LOCALAPPDATA");
     fs::path base = local.empty() ? g_root : fs::path(local);
-    return base / L"VRFullKeyboard" / L"logs" / L"perf_live_alpha_v3_9_10.ini";
+    return base / L"VRFullKeyboard" / L"logs" / L"perf_live_alpha_v3_9_11.ini";
 }
 
 bool IsCoreRunning() {
@@ -418,9 +447,17 @@ void RefreshPerfSnapshot() {
     }
     g_perfSnapshot = next;
     if (g_hwnd) {
-        if (HWND stop = GetDlgItem(g_hwnd, IDC_STOP_VR)) InvalidateRect(stop, nullptr, TRUE);
-        if (wasRunning != g_coreRunning) InvalidateRect(g_hwnd, nullptr, FALSE);
-        else InvalidateRect(g_hwnd, nullptr, FALSE);
+        // The performance timer runs every 500 ms. Repainting the entire top-level
+        // window here made every owner-drawn card/button visibly flash even though
+        // only the performance card had changed. Keep the refresh local.
+        if (wasRunning != g_coreRunning) {
+            if (HWND stop = GetDlgItem(g_hwnd, IDC_STOP_VR))
+                InvalidateRect(stop, nullptr, FALSE);
+        }
+        if (g_perfPaintRect.right > g_perfPaintRect.left &&
+            g_perfPaintRect.bottom > g_perfPaintRect.top) {
+            InvalidateRect(g_hwnd, &g_perfPaintRect, FALSE);
+        }
     }
 }
 
@@ -453,7 +490,8 @@ void SetBusy(bool busy) {
 }
 
 void RefreshStatus() {
-    g_coreReady = fs::exists(CoreExePath()) && fs::exists(OpenVrDllPath());
+    g_coreOutdated = IsCoreBuildOutdated();
+    g_coreReady = fs::exists(CoreExePath()) && fs::exists(OpenVrDllPath()) && !g_coreOutdated;
     g_cmakeReady = !FindCMake().empty();
     g_gitReady = !FindGit().empty();
     RefreshPerfSnapshot();
@@ -1227,6 +1265,19 @@ void LaunchCore(PendingLaunch mode) {
             MessageBoxW(g_hwnd, L"找不到 VRFullKeyboard.exe。", L"無法啟動", MB_ICONERROR);
         }
         return;
+    }
+    if (g_developerMode && !g_busy) {
+        std::wstring newerSource;
+        if (IsCoreBuildOutdated(&newerSource)) {
+            std::wstring message = L"偵測到 Source 已更新，但目前 Core EXE 仍是較舊的建置。\n\n";
+            if (!newerSource.empty()) message += L"較新的檔案：" + newerSource + L"\n\n";
+            message += L"要現在重新建置，完成後自動開啟嗎？";
+            if (MessageBoxW(g_hwnd, message.c_str(), L"Core EXE 已過期", MB_ICONWARNING | MB_YESNO) == IDYES) {
+                AppendLog(L"[建置] 偵測到 Source 新於 Core EXE，自動要求重新建置。\r\n");
+                PostMessageW(g_hwnd, WM_COMMAND, MAKEWPARAM(IDC_BUILD, BN_CLICKED), static_cast<LPARAM>((int)mode));
+            }
+            return;
+        }
     }
     std::wstring params;
     if (mode == PendingLaunch::Preview) params = L"--preview";
@@ -2028,6 +2079,11 @@ void Layout(HWND hwnd) {
     const int gap = ScaleForDpi(10, dpi);
     const int pad = ScaleForDpi(14, dpi);
     const LayoutMetrics lm = ComputeLayout(hwnd);
+    // Cache the only parent-window area that changes on the 500 ms performance timer.
+    // Include the section label and a small margin around the card for antialiasing.
+    g_perfPaintRect = lm.perfCard;
+    g_perfPaintRect.top = lm.perfLabelY;
+    InflateRect(&g_perfPaintRect, ScaleForDpi(2, dpi), ScaleForDpi(2, dpi));
 
     auto placeRow = [&](const RECT& card, const std::vector<int>& ids, int height) {
         const int count = (int)ids.size();
@@ -2090,7 +2146,8 @@ void PaintWindow(HWND hwnd, HDC dc) {
 
     int pillX = hx;
     const int pillY = lm.header.top + ScaleForDpi(85, dpi);
-    DrawPill(dc, pillX, pillY, g_coreReady ? L"已建置" : (g_developerMode ? L"尚未建置" : L"檔案不完整"), g_coreReady ? kGreen : kAmber, dpi);
+    const wchar_t* coreStatus = g_coreOutdated ? L"Core 過期" : (g_coreReady ? L"已建置" : (g_developerMode ? L"尚未建置" : L"檔案不完整"));
+    DrawPill(dc, pillX, pillY, coreStatus, g_coreReady ? kGreen : kAmber, dpi);
     DrawPill(dc, pillX, pillY, Utf8ToWide(VRFK_DISPLAY_VERSION) + L" · " + Utf8ToWide(VRFK_TEST_BUILD_LABEL), kAccent, dpi);
     DrawPill(dc, pillX, pillY, g_developerMode ? L"開發版" : L"分享版", kCyan, dpi);
     if (g_developerMode) {
@@ -2256,7 +2313,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        PaintWindow(hwnd, dc);
+
+        // Double-buffer the parent surface. The UI uses many custom-drawn panels;
+        // drawing them directly to the screen can expose intermediate frames during
+        // timer refreshes/resizes and looks like a full-window flash.
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        HDC memDc = CreateCompatibleDC(dc);
+        HBITMAP bitmap = memDc ? CreateCompatibleBitmap(dc, std::max(1, width), std::max(1, height)) : nullptr;
+        HGDIOBJ oldBitmap = (memDc && bitmap) ? SelectObject(memDc, bitmap) : nullptr;
+        if (memDc && bitmap) {
+            PaintWindow(hwnd, memDc);
+            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+                   ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+                   memDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+            SelectObject(memDc, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(memDc);
+        } else {
+            if (bitmap) DeleteObject(bitmap);
+            if (memDc) DeleteDC(memDc);
+            PaintWindow(hwnd, dc);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }

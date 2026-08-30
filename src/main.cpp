@@ -107,7 +107,9 @@ struct UiSettings {
     float activeTextureFps = 120.0f;
     float idleTextureFps = 30.0f;
 
-    // Font rendering mode. 0 = Clear (Segoe UI + Microsoft JhengHei), 1 = Standard JhengHei.
+    // Font rendering mode. 0 = Microsoft JhengHei, 1 = PMingLiU.
+    // TEST13 uses Microsoft JhengHei as the default UI face. The previous apparent
+    // clipping persistence was caused by a stale Core EXE being launched after Source edits.
     int fontStyle = 0;
 
     // V3.7 input layout mode (introduced in V3.6). Q9 keeps real VK_NUMPAD key codes and only changes the VR UI emphasis.
@@ -150,7 +152,7 @@ bool g_pointerVisible = false;
 ImGuiID g_hoverHapticItem = 0;
 bool g_hoverHapticSeenThisFrame = false;
 
-// Alpha V3.9.10 Test Build diagnostics. These timers observe the original
+// Test Build diagnostics. These timers observe the original
 // immediate V3.9.9-style pose/input loop without adding sleeps, pose caches or
 // WaitFrameSync. TB03's optional scheduler is texture-only and defaults off.
 struct PerfFrameSample {
@@ -184,7 +186,7 @@ PerfSummary g_perfSummary{};
 uint64_t g_perfLoopsSinceSummary = 0;
 std::chrono::steady_clock::time_point g_perfLastSummary{};
 
-constexpr wchar_t kControlExitEventName[] = L"Local\\VRFullKeyboard.Exit.AlphaV3_9_10";
+constexpr wchar_t kControlExitEventName[] = L"Local\\VRFullKeyboard.Exit.AlphaV3_9_11";
 HANDLE g_controlExitEvent = nullptr;
 
 static double FileTimeSeconds(const FILETIME& ft) {
@@ -206,11 +208,11 @@ static std::filesystem::path PerfLogDirectory() {
 }
 
 static std::filesystem::path PerfLogPath() {
-    return PerfLogDirectory() / L"perf_alpha_v3_9_10.csv";
+    return PerfLogDirectory() / L"perf_alpha_v3_9_11.csv";
 }
 
 static std::filesystem::path PerfLivePath() {
-    return PerfLogDirectory() / L"perf_live_alpha_v3_9_10.ini";
+    return PerfLogDirectory() / L"perf_live_alpha_v3_9_11.ini";
 }
 
 static float SampleProcessCpuPercent() {
@@ -1232,10 +1234,23 @@ bool SelectedButton(const char* label, bool selected, ImVec2 size) {
 // have a visual baseline that sits lower than ImGui's nominal font metrics.
 // Drawing the label ourselves lets us center the visible text independently of
 // ImGui::Button's baseline calculation while retaining normal ImGui interaction.
-bool EditorCenteredButton(const char* label, ImVec2 size, float visualYOffset = -3.5f) {
+bool EditorCenteredButton(const char* label, ImVec2 size, float visualYOffset = 0.0f) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (size.x < 0.0f) size.x = (std::max)(1.0f, avail.x + size.x + 1.0f);
     if (size.y <= 0.0f) size.y = ImGui::GetFrameHeight();
+
+    // TEST13 preview label fix V7:
+    // Custom-drawn buttons must follow ImGui's visible-label rule.  Text after
+    // "##"/"###" belongs to the widget ID and must never be painted.  The old
+    // renderer sized the visible part correctly but painted the full string,
+    // which exposed labels such as "拖曳鍵盤###vr_move_handle" on screen.
+    const char* visibleEnd = label + std::strlen(label);
+    if (const char* idMarker = std::strstr(label, "##")) visibleEnd = idMarker;
+
+    const ImVec2 textSize = ImGui::CalcTextSize(label, visibleEnd, false);
+    const float minLabelWidth = textSize.x + 24.0f;
+    size.x = (std::max)(size.x, minLabelWidth);
+    size.y = (std::max)(size.y, textSize.y + 16.0f);
 
     ImGui::PushID(label);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1255,11 +1270,11 @@ bool EditorCenteredButton(const char* label, ImVec2 size, float visualYOffset = 
     if (style.FrameBorderSize > 0.0f)
         dl->AddRect(p0, p1, border, style.FrameRounding, 0, style.FrameBorderSize);
 
-    const ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, true);
     const ImVec2 textPos(
         p0.x + (size.x - textSize.x) * 0.5f,
         p0.y + (size.y - textSize.y) * 0.5f + visualYOffset);
-    dl->AddText(textPos, textColor, label);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), textPos, textColor,
+                label, visibleEnd);
     TrackHoverHaptic(itemId, hovered);
     ImGui::PopID();
     return clicked;
@@ -1276,8 +1291,15 @@ bool EditorCenteredSelectedButton(const char* label, bool selected, ImVec2 size)
     return clicked;
 }
 
+float g_previewKeyboardScaleCap = 1.35f;
+
 float KeyboardScale() {
-    return std::clamp(g_ui.keyboardScale, 0.55f, 1.35f);
+    float scale = std::clamp(g_ui.keyboardScale, 0.55f, 1.35f);
+    // Desktop preview must fit the complete full-size keyboard into its child area.
+    // The previous fixed table widths underestimated the real key-row width, so the
+    // right-most NumPad column could be clipped even though the font itself was fine.
+    if (g_previewMode) scale = (std::min)(scale, g_previewKeyboardScaleCap);
+    return scale;
 }
 
 float W(float units) {
@@ -3190,7 +3212,7 @@ void DrawMoveHandle(vr::VROverlayHandle_t overlay) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.26f, 0.38f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.36f, 0.54f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.48f, 0.68f, 1.0f));
-    ImGui::Button(stableLabel.c_str(), ImVec2(112, 48));
+    EditorCenteredButton(stableLabel.c_str(), ImVec2(112, 48));
     const bool moveHandleActivated = ImGui::IsItemActivated();
     TrackHoverHaptic(ImGui::GetID("###vr_move_handle"), ImGui::IsItemHovered() && !moveHandleActivated);
     ImGui::PopStyleColor(3);
@@ -3235,97 +3257,97 @@ void DrawTopBar(vr::VROverlayHandle_t overlay) {
 
     // Row 1: day-to-day controls. Placement controls are deliberately hidden
     // in Normal mode so ordinary typing cannot accidentally move the overlay.
-    if (SelectedButton("鍵盤", g_page == PageMode::Keyboard && !g_ui.q9Mode, ImVec2(82, 44))) {
+    if (EditorCenteredSelectedButton("鍵盤", g_page == PageMode::Keyboard && !g_ui.q9Mode, ImVec2(82, 48))) {
         g_page = PageMode::Keyboard;
         g_ui.q9Mode = false;
         if (g_autoSave) SaveSettings();
     }
     ImGui::SameLine();
-    if (SelectedButton("九方模式", g_page == PageMode::Keyboard && g_ui.q9Mode, ImVec2(108, 44))) {
+    if (EditorCenteredSelectedButton("九方模式", g_page == PageMode::Keyboard && g_ui.q9Mode, ImVec2(108, 48))) {
         g_page = PageMode::Keyboard;
         g_ui.q9Mode = !g_ui.q9Mode;
         if (g_autoSave) SaveSettings();
     }
     ImGui::SameLine();
-    if (SelectedButton("快捷鍵", g_page == PageMode::Shortcuts, ImVec2(92, 44))) g_page = PageMode::Shortcuts;
+    if (EditorCenteredSelectedButton("快捷鍵", g_page == PageMode::Shortcuts, ImVec2(92, 48))) g_page = PageMode::Shortcuts;
     ImGui::SameLine();
-    if (SelectedButton("剪貼簿", g_page == PageMode::Clipboard, ImVec2(92, 44))) {
+    if (EditorCenteredSelectedButton("剪貼簿", g_page == PageMode::Clipboard, ImVec2(92, 48))) {
         g_page = PageMode::Clipboard;
         UpdateClipboardHistory(true);
     }
     ImGui::SameLine();
     const UpdateCheckResult updateSnapshot = GetUpdateSnapshot();
     const char* updateLabel = updateSnapshot.state == UpdateCheckState::Available ? "更新!" : "更新";
-    if (SelectedButton(updateLabel, g_page == PageMode::Update, ImVec2(82, 44))) g_page = PageMode::Update;
+    if (EditorCenteredSelectedButton(updateLabel, g_page == PageMode::Update, ImVec2(82, 48))) g_page = PageMode::Update;
     ImGui::SameLine(0, 18.0f);
-    if (SelectedButton("一般模式", g_interactionMode == InteractionMode::Normal, ImVec2(96,44))) {
+    if (EditorCenteredSelectedButton("一般模式", g_interactionMode == InteractionMode::Normal, ImVec2(96,48))) {
         if (g_vrGrabActive && g_vrGrabInputSource == GrabInputSource::GripLayout) EndVrGrab(overlay);
         g_interactionMode = InteractionMode::Normal;
         g_vrPlacementStatus = "一般模式：指向鍵盤按 Grip 可自由抓取";
     }
     ImGui::SameLine();
-    if (SelectedButton("版面配置", g_interactionMode == InteractionMode::Layout, ImVec2(104,44))) {
+    if (EditorCenteredSelectedButton("版面配置", g_interactionMode == InteractionMode::Layout, ImVec2(104,48))) {
         g_interactionMode = InteractionMode::Layout;
         g_vrPlacementStatus = "版面配置：可抓取、推拉與縮放";
     }
     ImGui::SameLine(0, 18.0f);
-    if (SelectedButton("手腕圓點", g_wristStandby, ImVec2(112,44))) EnterWristStandby(overlay);
+    if (EditorCenteredSelectedButton("手腕圓點", g_wristStandby, ImVec2(112,48))) EnterWristStandby(overlay);
     ImGui::SameLine();
-    if (ImGui::Button("召喚", ImVec2(82,44))) SummonKeyboard(overlay, g_wristStandby);
+    if (EditorCenteredButton("召喚", ImVec2(82,48))) SummonKeyboard(overlay, g_wristStandby);
     ImGui::SameLine();
     if (!g_returnWorldTransformValid) ImGui::BeginDisabled();
-    if (ImGui::Button("返回原位", ImVec2(108,44))) ReturnKeyboard(overlay);
+    if (EditorCenteredButton("返回原位", ImVec2(108,48))) ReturnKeyboard(overlay);
     if (!g_returnWorldTransformValid) ImGui::EndDisabled();
     ImGui::SameLine(0, 18.0f);
-    if (ImGui::Button("清除組合鍵", ImVec2(126,42))) g_mods.clear();
+    if (EditorCenteredButton("清除組合鍵", ImVec2(126,46))) g_mods.clear();
     if (g_previewMode) {
         ImGui::SameLine(0, 18.0f);
-        if (SelectedButton("編輯預覽", g_editorMode, ImVec2(108,42))) g_editorMode = !g_editorMode;
+        if (EditorCenteredSelectedButton("編輯預覽", g_editorMode, ImVec2(108,46))) g_editorMode = !g_editorMode;
     }
     ImGui::SameLine(0, 18.0f);
-    if (ImGui::Button("關閉", ImVec2(74,42))) g_running = false;
+    if (EditorCenteredButton("關閉", ImVec2(74,46))) g_running = false;
 
     if (g_interactionMode == InteractionMode::Layout) {
         // Row 2 exists only in Layout mode.
-        if (SelectedButton("世界固定", !g_wristStandby && g_anchor == AnchorMode::WorldFixed, ImVec2(112,42))) {
+        if (EditorCenteredSelectedButton("世界固定", !g_wristStandby && g_anchor == AnchorMode::WorldFixed, ImVec2(112,46))) {
             cancelWrist(); g_anchor = AnchorMode::WorldFixed; apply(true);
         }
         ImGui::SameLine();
-        if (SelectedButton("固定視野", !g_wristStandby && g_anchor == AnchorMode::HeadLocked, ImVec2(108,42))) {
+        if (EditorCenteredSelectedButton("固定視野", !g_wristStandby && g_anchor == AnchorMode::HeadLocked, ImVec2(108,46))) {
             cancelWrist(); g_anchor = AnchorMode::HeadLocked; apply();
         }
         ImGui::SameLine();
-        if (SelectedButton("左手", !g_wristStandby && g_anchor == AnchorMode::LeftHand, ImVec2(78,42))) {
+        if (EditorCenteredSelectedButton("左手", !g_wristStandby && g_anchor == AnchorMode::LeftHand, ImVec2(78,46))) {
             cancelWrist(); g_anchor = AnchorMode::LeftHand; apply();
         }
         ImGui::SameLine();
-        if (SelectedButton("右手", !g_wristStandby && g_anchor == AnchorMode::RightHand, ImVec2(78,42))) {
+        if (EditorCenteredSelectedButton("右手", !g_wristStandby && g_anchor == AnchorMode::RightHand, ImVec2(78,46))) {
             cancelWrist(); g_anchor = AnchorMode::RightHand; apply();
         }
         ImGui::SameLine(0, 18.0f);
         if (!g_previewMode || g_editorMode) DrawMoveHandle(overlay);
         if (!g_previewMode || g_editorMode) ImGui::SameLine();
-        if (ImGui::Button("縮小", ImVec2(78,42))) {
+        if (EditorCenteredButton("縮小", ImVec2(78,46))) {
             g_widthMeters = (std::max)(0.80f, g_widthMeters - 0.10f); apply();
             if (g_autoSave) SaveSettings();
         }
         ImGui::SameLine();
-        if (ImGui::Button("放大", ImVec2(78,42))) {
+        if (EditorCenteredButton("放大", ImVec2(78,46))) {
             g_widthMeters = (std::min)(2.50f, g_widthMeters + 0.10f); apply();
             if (g_autoSave) SaveSettings();
         }
         ImGui::SameLine();
-        if (ImGui::Button("靠近", ImVec2(78,42))) {
+        if (EditorCenteredButton("靠近", ImVec2(78,46))) {
             g_distance = (std::max)(0.45f, g_distance - 0.08f); apply();
             if (g_autoSave) SaveSettings();
         }
         ImGui::SameLine();
-        if (ImGui::Button("遠離", ImVec2(78,42))) {
+        if (EditorCenteredButton("遠離", ImVec2(78,46))) {
             g_distance = (std::min)(1.50f, g_distance + 0.08f); apply();
             if (g_autoSave) SaveSettings();
         }
         ImGui::SameLine(0, 18.0f);
-        if (ImGui::Button("面向我", ImVec2(90,42))) FaceOverlayTowardHmd(overlay);
+        if (EditorCenteredButton("面向我", ImVec2(90,46))) FaceOverlayTowardHmd(overlay);
         ImGui::SameLine(0, 18.0f);
         ImGui::TextDisabled("%s", g_vrPlacementStatus.c_str());
     }
@@ -3519,7 +3541,7 @@ void ApplyLiveStyleSettings() {
 
 void FitKeyboardToArea(const ImVec2& area) {
     // Approximate natural full-keyboard bounds before keyboardScale is applied.
-    constexpr float baseW = 1885.0f;
+    constexpr float baseW = 2130.0f;
     constexpr float baseH = 505.0f;
     const float sx = (std::max)(400.0f, area.x - 28.0f) / baseW;
     const float sy = (std::max)(260.0f, area.y - 34.0f) / baseH;
@@ -3581,7 +3603,7 @@ void DrawEditorSidebar() {
             changed |= ImGui::SliderFloat("功能鍵字", &g_ui.compactFont, 14.0f, 24.0f, "%.0f px");
             ImGui::SeparatorText("字體清晰度");
             int oldFontStyle = g_ui.fontStyle;
-            const char* fontModes[] = { "清晰：Segoe UI + 微軟正黑體", "標準：微軟正黑體" };
+            const char* fontModes[] = { "微軟正黑體（Microsoft JhengHei）", "備用：新細明體（PMingLiU）" };
             changed |= ImGui::Combo("字體樣式", &g_ui.fontStyle, fontModes, IM_ARRAYSIZE(fontModes));
             if (g_ui.fontStyle != oldFontStyle) g_fontRestartRequired = true;
             if (g_fontRestartRequired) ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "重新啟動預覽 / VR 後套用新字體");
@@ -3954,6 +3976,22 @@ void DrawKeyboardPreviewArea(vr::VROverlayHandle_t overlay, const ImVec2& areaSi
     }
     ImGui::Separator();
 
+    // Preview-only auto-fit cap.  The real full keyboard is ~2130 px wide at
+    // 1.0x once all key widths, inter-column gaps and table cell padding are
+    // included.  Clamp only the preview render scale; never overwrite the saved
+    // VR keyboard scale. This keeps the complete NumPad and every legend inside
+    // the visible desktop preview instead of clipping the right edge.
+    if (g_previewMode) {
+        const float previewW = ImGui::GetContentRegionAvail().x;
+        constexpr float kFullKeyboardNaturalWidth = 2130.0f;
+        constexpr float kPreviewSafetyMargin = 18.0f;
+        g_previewKeyboardScaleCap = std::clamp(
+            (previewW - kPreviewSafetyMargin) / kFullKeyboardNaturalWidth,
+            0.55f, 1.35f);
+    } else {
+        g_previewKeyboardScaleCap = 1.35f;
+    }
+
     ImVec2 start = ImGui::GetCursorPos();
     ImGui::SetCursorPos(ImVec2(start.x + g_ui.keyboardOffsetX, start.y + g_ui.keyboardOffsetY));
 
@@ -3998,6 +4036,7 @@ void DrawUI(vr::VROverlayHandle_t overlay) {
     }
 
     if (g_previewMode) {
+        ImGui::Dummy(ImVec2(0.0f, 2.0f));
         ImGui::TextUnformatted("桌面預覽｜安全模式：點擊按鍵不會向 Windows 傳送輸入");
         ImGui::Separator();
     }
@@ -4508,7 +4547,7 @@ void SetupStyle() {
     s.FrameRounding = 9.0f;
     s.WindowPadding = ImVec2(14, 10);
     s.ItemSpacing = ImVec2(g_ui.gap, g_ui.gap);
-    s.FramePadding = ImVec2(10, 8);
+    s.FramePadding = ImVec2(10, 6);
 
     s.Colors[ImGuiCol_WindowBg] = ImVec4(
         g_ui.backgroundColor[0], g_ui.backgroundColor[1], g_ui.backgroundColor[2], g_ui.backgroundAlpha);
@@ -4522,11 +4561,9 @@ void SetupStyle() {
 void LoadFont() {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Build a compact extra-glyph range instead of the entire ChineseFull range.
-    // This keeps the atlas small while covering every Traditional Chinese / Bopomofo
-    // string used by the app.
-    static ImVector<ImWchar> extraRanges;
-    if (extraRanges.empty()) {
+    // Compact app-specific Traditional Chinese / Bopomofo range.
+    static ImVector<ImWchar> appRanges;
+    if (appRanges.empty()) {
         ImFontGlyphRangesBuilder builder;
         static const ImWchar extra[] = {
             0x02C0, 0x02FF, // tone marks
@@ -4536,86 +4573,55 @@ void LoadFont() {
             0xFF00, 0xFFEF, // full-width punctuation
             0,
         };
+        builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
         builder.AddRanges(extra);
-        builder.AddText("一三上下不世並中主也了仍以位住作使供保修個值做停側傳儲先入內全共再分切到制前剪功加動化區卡即原取另只召可台史右合名向含命和員啟喚單器回固圓圖在型執基塞外大失套字存安完定容實寫寬寸對小尚尺工左巨已常帽底度座建式強彩待後得從復快恢感態應成我或截房所手打扳把抓拖持指按捲捷採接控提換援擊操擬支改放效敗整數文新方於旋日明時景暫曳更會有未本板格框桌標模橘機檔次止此歷段毫沒法注淡混清測滑灣為無照版狀理用界留畫發的盤目直眼示秒移程稱窗立符第等算管簡簿籤粗精紅紫細組綠維編縮置背能腕自與般色英著藍處號虹行裁製複見視覽觀角觸言訂計記設試語誤說調讀貼起距跟載輕輯輸轉近返送透這通速連進遠適選還部配重野量鈕錯鍵長閉開閒間關防阻附除階隔際隨集離震靜非靠面韓音頁預顆顏顯饋驗體高點鼠清晰標準微軟正黑體重新啟動後套用雙擊間隔長按時間圓點大小透明度單擊展開收起完整鍵盤召喚到眼前返回原位手腕模式");
+        builder.AddText("一三上下不世並中主也了仍以位住作使供保修個值做停側傳儲先入內全共再分切到制前剪功加動化區卡即原取另只召可台史右合名向含命和員啟喚單器回固圓圖在型執基塞外大失套字存安完定容實寫寬寸對小尚尺工左巨已常帽底度座建式強彩待後得從復快恢感態應成我或截房所手打扳把抓拖持指按捲捷採接控提換援擊操擬支改放效敗整數文新方於旋日明時景暫曳更會有未本板格框桌標模橘機檔次止此歷段毫沒法注淡混清測滑灣為無照版狀理用界留畫發的盤目直眼示秒移程稱窗立符第等算管簡簿籤粗精紅紫細組綠維編縮置背能腕自與般色英著藍處號虹行裁製複見視覽觀角觸言訂計記設試語誤說調讀貼起距跟載輕輯輸轉近返送透這通速連進遠適選還部配重野量鈕錯鍵長閉開閒間關防阻附除階隔際隨集離震靜非靠面韓音頁預顆顏顯饋驗體高點鼠清晰標準微軟正黑體新細明體重新啟動後套用雙擊間隔長按時間圓點大小透明度單擊展開收起完整鍵盤召喚到眼前返回原位手腕模式");
         builder.AddText("更新檢查版本最新發現倉庫來源正在名稱內容下載覆蓋程式檔案自動驗證備份綁定建立正式位址填入固定啟用回傳網路連線請求失敗目前已是最新版開啟資訊階段加入任何");
-        builder.BuildRanges(&extraRanges);
+        builder.BuildRanges(&appRanges);
     }
 
-    static const ImWchar* latinRanges = io.Fonts->GetGlyphRangesDefault();
-    const char* jhengHei = "C:\\Windows\\Fonts\\msjh.ttc";
-    const wchar_t* jhengHeiW = L"C:\\Windows\\Fonts\\msjh.ttc";
-    const char* segoe = "C:\\Windows\\Fonts\\segoeui.ttf";
-    const wchar_t* segoeW = L"C:\\Windows\\Fonts\\segoeui.ttf";
-
+    io.Fonts->Clear();
     g_fontLoaded = false;
 
-    if (g_ui.fontStyle == 0 && GetFileAttributesW(segoeW) != INVALID_FILE_ATTRIBUTES &&
-        GetFileAttributesW(jhengHeiW) != INVALID_FILE_ATTRIBUTES) {
-        // Clear mode: use Segoe UI for Latin/UI glyphs, then merge JhengHei only
-        // for Traditional Chinese/Bopomofo. Pixel snapping improves small legends.
-        ImFontConfig latinCfg{};
-        latinCfg.OversampleH = 3;
-        latinCfg.OversampleV = 2;
-        latinCfg.PixelSnapH = true;
-        ImFont* base = io.Fonts->AddFontFromFileTTF(segoe, 30.0f, &latinCfg, latinRanges);
-        if (base) {
-            ImFontConfig zhCfg{};
-            zhCfg.MergeMode = true;
-            zhCfg.PixelSnapH = true;
-            zhCfg.OversampleH = 3;
-            zhCfg.OversampleV = 2;
-            if (io.Fonts->AddFontFromFileTTF(jhengHei, 30.0f, &zhCfg, extraRanges.Data)) {
+    // TEST13: Microsoft JhengHei is the primary Traditional Chinese UI face.
+    if (g_ui.fontStyle == 0) {
+        const wchar_t* jhengW = L"C:\\Windows\\Fonts\\msjh.ttc";
+        const char* jheng = "C:\\Windows\\Fonts\\msjh.ttc";
+        if (GetFileAttributesW(jhengW) != INVALID_FILE_ATTRIBUTES) {
+            ImFontConfig cfg{};
+            cfg.OversampleH = 2;
+            cfg.OversampleV = 2;
+            cfg.PixelSnapH = false;
+            cfg.GlyphOffset = ImVec2(0.0f, 0.0f);
+            if (io.Fonts->AddFontFromFileTTF(jheng, 26.0f, &cfg, appRanges.Data)) {
                 g_fontLoaded = true;
-                g_fontStatus = "OK: Segoe UI + Microsoft JhengHei (Clear)";
+                g_fontStatus = "OK: Microsoft JhengHei";
             }
         }
     }
 
+    // User-selectable fallback / automatic fallback if JhengHei is unavailable.
     if (!g_fontLoaded) {
-        // If clear mode partially added Segoe UI but the Chinese merge failed,
-        // remove that partial atlas so the fallback font becomes the real default.
         io.Fonts->Clear();
-        // Standard / fallback mode: single JhengHei font with a compact merged range.
-        static ImVector<ImWchar> allRanges;
-        if (allRanges.empty()) {
-            ImFontGlyphRangesBuilder allBuilder;
-            allBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-            allBuilder.AddRanges(extraRanges.Data);
-            allBuilder.BuildRanges(&allRanges);
-        }
-
-        const wchar_t* candidatesW[] = {
-            L"C:\\Windows\\Fonts\\msjh.ttc",
-            L"C:\\Windows\\Fonts\\msjhbd.ttc",
-            L"C:\\Windows\\Fonts\\mingliu.ttc",
-            L"C:\\Windows\\Fonts\\kaiu.ttf"
-        };
-        const char* candidates[] = {
-            "C:\\Windows\\Fonts\\msjh.ttc",
-            "C:\\Windows\\Fonts\\msjhbd.ttc",
-            "C:\\Windows\\Fonts\\mingliu.ttc",
-            "C:\\Windows\\Fonts\\kaiu.ttf"
-        };
-        const char* names[] = { "Microsoft JhengHei", "Microsoft JhengHei Bold", "MingLiU", "DFKai-SB" };
-
-        for (int i = 0; i < 4; ++i) {
-            if (GetFileAttributesW(candidatesW[i]) == INVALID_FILE_ATTRIBUTES) continue;
+        const wchar_t* pmingW = L"C:\\Windows\\Fonts\\mingliu.ttc";
+        const char* pming = "C:\\Windows\\Fonts\\mingliu.ttc";
+        if (GetFileAttributesW(pmingW) != INVALID_FILE_ATTRIBUTES) {
             ImFontConfig cfg{};
+            cfg.FontNo = 1; // PMingLiU face inside mingliu.ttc (0=MingLiU, 1=PMingLiU)
             cfg.OversampleH = 3;
             cfg.OversampleV = 2;
             cfg.PixelSnapH = true;
-            if (io.Fonts->AddFontFromFileTTF(candidates[i], 29.0f, &cfg, allRanges.Data)) {
+            cfg.GlyphOffset = ImVec2(0.0f, 0.0f);
+            if (io.Fonts->AddFontFromFileTTF(pming, 26.0f, &cfg, appRanges.Data)) {
                 g_fontLoaded = true;
-                g_fontStatus = std::string("OK: ") + names[i] + " (Standard)";
-                break;
+                g_fontStatus = "OK: PMingLiU (Fallback)";
             }
         }
     }
 
     if (!g_fontLoaded) {
         io.Fonts->AddFontDefault();
-        g_fontStatus = "ERROR: Chinese font not found";
+        g_fontStatus = "ERROR: Traditional Chinese system font not found";
     }
 }
 

@@ -2,11 +2,13 @@
 
 ## Name
 
-**VRFullKeyboard Alpha V3.9.10 Test Build 03 — Dashboard Grip Bypass TEST13**
+**VRFullKeyboard Alpha V3.9.11 Test Build 03 — Dashboard Grip Bypass TEST13**
 
-正式 SemVer 維持 **3.9.10**，Test Build 維持 **03**。本基準由 TB03 Overlay Interaction Integration 延伸，已完成 Windows/MSVC 建置與 Valve Index / Knuckles SteamVR 實測。
+正式 SemVer 已推進至 **3.9.11**，Test Build 維持 **03**。本基準由 TB03 Overlay Interaction Integration 延伸，已完成 Windows/MSVC 建置與 Valve Index / Knuckles SteamVR 實測。
 
-版本來源：`VERSION=3.9.10`、`TEST_BUILD=03`。
+版本來源：`VERSION=3.9.11`、`TEST_BUILD=03`。
+
+V3.9.11 version bump：TEST13 已驗證功能與 UI 修正整併為目前主線；Test Build 編號仍維持 03。
 
 ## Validated baseline
 

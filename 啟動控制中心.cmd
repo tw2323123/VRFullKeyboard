@@ -13,13 +13,19 @@ set "PROJECT_TEST_BUILD="
 set /p PROJECT_TEST_BUILD=<TEST_BUILD
 set "PROJECT_BUILD_ID=%PROJECT_VERSION%-TB%PROJECT_TEST_BUILD%"
 
-rem Daily launches do not rebuild the Control Center when SemVer + Test Build match.
+rem Daily launches reuse the Control Center only when both the build id and
+rem Control Center Source timestamps are current. This prevents ZIP/source updates
+rem from silently launching an older .frontend\VRFullKeyboardControl.exe.
 if exist "%CONTROL_EXE%" if exist "%CONTROL_VERSION_FILE%" (
     set "BUILT_VERSION="
     set /p BUILT_VERSION=<"%CONTROL_VERSION_FILE%"
     if "%BUILT_VERSION%"=="%PROJECT_BUILD_ID%" (
-        start "" "%CONTROL_EXE%"
-        exit /b 0
+        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+          "$exe=(Get-Item -LiteralPath '.frontend\VRFullKeyboardControl.exe').LastWriteTimeUtc; $inputs=@('src\control_center.cpp','CMakeLists.txt','VERSION','TEST_BUILD','cmake\VRFullKeyboardVersion.h.in'); foreach($p in $inputs){if((Test-Path -LiteralPath $p) -and (Get-Item -LiteralPath $p).LastWriteTimeUtc -gt $exe){exit 1}}; exit 0" >nul 2>nul
+        if not errorlevel 1 (
+            start "" "%CONTROL_EXE%"
+            exit /b 0
+        )
     )
 )
 
