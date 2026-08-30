@@ -1,89 +1,52 @@
-# Changelog
+# Alpha V3.9.10 TB03 — Knuckles Grip VALIDATED
 
-## 3.9.6
+## SteamVR 實測通過
+- Valve Index / Knuckles：一般模式可直接以抓握手勢自由抓取鍵盤。
+- 放開抓握後，鍵盤固定在新的世界位置。
+- 手腕圓點可由另一手以同樣抓握手勢重新校準位置，並保存 wrist-local X/Y/Z offset。
+- Backspace、Delete、方向鍵改為單次觸發；PageUp / PageDown 保留長按連發。
+- SteamVR Dashboard 保持原生操作，不使用 SteamVR Action Manifest、不註冊 binding JSON。
+- 鍵盤初始尺寸、距離、角度、曲面、Pointer 命中、按鍵發光同步與整體低延遲體感均已通過本輪 SteamVR 實測。
+- 已移除 TEST8～TEST10 的 Grip 診斷 UI、即時顯示與 CSV 記錄，只保留正式互動邏輯。
 
-- 開發版控制中心新增「發布 GitHub 新版本」。
-- 發布視窗可直接輸入版本號並在送出前二次確認。
-- 發布流程內建安全同步：暫存未提交修改 → pull --rebase → 還原修改 → 更新 VERSION。
-- 自動 Commit、Push main、建立 annotated Tag 並 Push Tag，之後交由 GitHub Actions 建立 ZIP、SHA256 與 Release。
-- 發布前檢查 main 分支、Git、.git Repository、版本格式與重複 Tag。
-- Tag Push 失敗時會移除本機新建 Tag，讓同一版本可安全重試。
-- 「建立分享版」說明改為明確表示會自動建置最新版再產生 ZIP / SHA256。
-- 發布功能完全整合在 control_center.cpp，不需要額外 PowerShell / CMD 發布腳本。
+## Knuckles 抓取手勢
+- 張開抓握手指離開 Grip 感測區，系統進入 armed。
+- 再握回控制器並穩定接觸約 70 ms，開始抓取。
+- 再次張開並離開 Grip 感測區約 100 ms，結束抓取。
+- 此路徑使用 legacy OpenVR `ulButtonTouched` 的 Grip bit，不會接管 SteamVR Dashboard 系統輸入。
 
-## 3.9.5
+# Alpha V3.9.10 - Test Build 03
 
-- 修正編輯預覽中文字按鈕在部分 DPI / 微軟正黑體下視覺基線偏低的問題。
-- 編輯器全寬按鈕改為自訂垂直置中文字繪製，不再依賴 ImGui 中文字型 baseline。
-- 不影響 VR 鍵盤本體鍵帽，並保留 Hover、Active、Click、Border 與圓角行為。
-- 保留 V3.9.3 的裁切修正、UI 間距解耦與自動儲存 I/O 優化。
+## VR 懸浮視窗互動整合
+- 新增一般／版面配置模式，移動與固定控制只在版面配置模式顯示。
+- 新增 Grip 指向抓取、搖桿推拉／縮放、放開自動面向 HMD 與「面向我」動作。
+- 新增可分離的位置／旋轉阻尼；阻尼 0 保留 TB02 直接 controller-relative 路徑。
+- 完整鍵盤可套用 OpenVR 曲率，手腕圓點維持平面。
+- 新增可設定的 VR 游標與懸停觸覺回饋。
+- 手腕圓點採獨立圓形 hit mask，離開命中區時明確釋放 ImGui 按鍵狀態。
+- 修正 Windows 延伸鍵與 NumPad Enter 映射。
+- 新增可選 active／idle 材質更新率；只節流 D3D 與 overlay texture submit，預設關閉且不更動輸入／姿勢 loop。
+- 新增 `TEST_BUILD` 建置識別；CMake 顯示標籤與控制中心 bootstrap cache 同步使用，SemVer 不變時也不會誤開舊前端。
 
-## 3.9.3
-- Fixed editor sidebar controls being clipped near the bottom of scrollable pages.
-- Removed the obsolete "防裁切版" development label.
-- Decoupled editor spacing from keyboard key-gap settings.
-- Added explicit shortcut editor row sizing and cell padding for reliable text-field layout.
-- Added bottom scroll breathing room for Appearance and Shortcut pages.
-- Reduced unnecessary INI writes by deferring editor auto-save until the active control is released.
+## Test Build 02 基準（保留）
 
-## 3.9.2
-- 建置前會檢查 `build/CMakeCache.txt` 綁定的 Source 路徑；若專案曾搬家、改名或由舊版資料夾複製而造成路徑不一致，控制中心會自動清除舊快取並重新 Configure。
-- 分享版啟動後約 1.6 秒會在背景檢查 GitHub Latest Release，不主動跳出視窗。
-- 發現新版時，「更新與版本」按鈕與頂部狀態徽章會直接顯示可用版本。
-- 更新下載期間在按鈕上顯示下載百分比、SHA256 驗證、解壓與準備安裝等階段。
-- 更新成功重啟後會顯示「舊版本 → 新版本」完成提示。
-- 更新備份改為只保留最近一份 `backup_previous`，避免長期累積。
-- 啟動新版控制中心後加入短暫健康檢查；若新版立即退出，Updater 會自動 Rollback 並重新啟動舊版。
-- 開發版新增「測試更新回復」工具，使用隔離暫存資料驗證備份、還原、新增檔案清理與 `VRFullKeyboard.ini` 保護。
-- 更新前會清理舊的暫存下載目錄，但保留最近一次版本備份。
+## 手腕圓點輸入修正
+- 手腕待機時將 Overlay Input Method 改為 `None`，不再同時接收 SteamVR 原生 Mouse 與自訂輸入。
+- `DriveWristOverlayInteraction()` 成為手腕圓點唯一輸入來源，保留控制器雷射與近距離觸碰兩條路徑。
+- 手腕待機時忽略切換前殘留的 MouseMove / MouseButtonDown / MouseButtonUp 事件。
+- 完整鍵盤模式不受影響，仍使用 SteamVR 原生 Mouse 輸入。
+- 目標是修正單擊／雙擊偶發重複、長按不穩定與游標跳動；仍需 Windows 建置與 VR 實機回歸確認。
 
-## 3.9.1
-- 自動更新端到端驗證版本。
-- 不變更 VR 鍵盤核心操作與介面配置，專門測試 3.9.0 → 3.9.1 更新流程。
-- 更新完成後可直接由控制中心版本徽章確認已升級至 3.9.1。
-- GitHub Actions runner 固定使用已驗證成功的 `windows-2022`。
-- 保留 ZIP + SHA256 驗證、Updater 備份/替換/重啟與 `VRFullKeyboard.ini` 保護機制。
+## 測試基準
+- 版本顯示回退並固定為 **Alpha V3.9.10**，之後測試用 Test Build 編號區分，不再快速消耗正式 SemVer。
+- 延續上一個 regression fix：保留 V3.9.9 式即時主迴圈，不加入 `sleep_until`、`WaitFrameSync`、FPS cap、Pose cache 或 Dirty Render。
 
-## 3.9.0
-- 綁定官方 GitHub Repository：`tw2323123/VRFullKeyboard`。
-- 3.9.0 是第一個具備完整更新器的版本；3.8.6 → 3.9.0 需手動更新一次，之後版本可由控制中心更新。
-- 控制中心「更新與版本」可直接檢查 GitHub Latest Release。
-- 新增自動下載 Windows 分享版 ZIP 與 SHA256。
-- 下載完成後會先驗證 SHA256，驗證失敗不修改現有程式。
-- 新增獨立 `VRFullKeyboardUpdater.exe`，可在控制中心關閉後安全替換 EXE / DLL。
-- 更新前自動備份被覆蓋檔案；套用失敗時嘗試還原。
-- 更新流程明確保護 `VRFullKeyboard.ini`，保留個人設定。
-- 分享版加入 Updater，但仍不需要 Visual Studio / CMake / Git。
-- GitHub Actions 改用現代 FetchContent 寫法並加入 Tag → Release 自動封裝流程。
+## 控制中心
+- 新增「關閉鍵盤」按鈕：透過命名 Event 要求 VRFullKeyboard 優雅結束，方便反覆測試，不需要開工作管理員。
+- 新增「即時效能監測」面板，每 0.5 秒顯示 CPU、Loop/s、Tracking、Events、Logic、ImGui、D3D、SetOverlayTexture、Total 的平均/最大耗時。
+- 新增「效能報告 CSV」按鈕，可直接定位報告。
 
-## 3.8.6
-- 分享版控制中心精簡為 4 個啟動選項 + 建立桌面捷徑。
-- 分享版隱藏開發工具、資料夾工具與作業記錄區。
-- 分享版使用較小的預設視窗與最小尺寸。
-- 開發版完整控制中心介面維持不變。
-
-## 3.8.5
-
-- Fix Control Center UI compilation on MSVC caused by mixing Win32 `LONG` values with `int` in `std::max`.
-- Normalize log panel geometry to explicit integer dimensions before calling `MoveWindow`.
-- Keep the V3.8.4 dark UI redesign and all V3.8.3 build/share behavior unchanged.
-
-## 3.8.4
-
-- Rebuilt the Control Center visual layer with a dark SteamVR-oriented interface.
-- Added clear Launch / Development & Release / Tools / Activity sections.
-- Added colored status badges for build state, version, package type, CMake, and Git.
-- Added primary/secondary/utility button hierarchy with hover, pressed, focus, and disabled states.
-- Added a collapsible dark activity log panel.
-- Added Clear Log and Copy Log actions while keeping the persistent build log unchanged.
-- Long-running build/package operations automatically expand the activity log.
-- Added per-monitor DPI awareness and DPI-responsive layout/font scaling.
-- Added Windows dark title-bar integration where supported.
-- Kept the Control Center dependency-free from OpenVR and Dear ImGui.
-- Kept the prebuilt share package workflow unchanged: end users do not need Visual Studio, CMake, Git, or a build step.
-
-## 3.8.3
-
-- Decoupled Control Center bootstrap build from OpenVR/ImGui fetching.
-- Fixed bootstrap compiler warnings.
-- Clarified source/developer build versus prebuilt share package behavior.
+## 自動效能報告
+- 核心每 0.5 秒寫入 `%LOCALAPPDATA%\VRFullKeyboard\logs\perf_alpha_v3_9_10.csv`。
+- 同時寫入輕量 live snapshot，供控制中心顯示。
+- 偵測器只做計時與低頻檔案寫入，不改變 VR 主迴圈節奏。

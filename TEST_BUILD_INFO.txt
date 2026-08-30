@@ -1,0 +1,72 @@
+VR Full Keyboard
+Alpha V3.9.10 · Test Build 03
+
+Overlay interaction integration
+- Normal mode hides placement controls.
+- Layout mode supports grip-point grab and thumbstick push/pull + scale.
+- Optional independent position/rotation damping defaults to zero.
+- Optional auto-face-on-release and manual Face Me action.
+- Expanded keyboard curvature; wrist launcher remains flat.
+- Configurable pointer and hover haptics.
+- Circular wrist hit mask independent from the visible dot.
+- Correct Windows extended-key and Numpad Enter mapping.
+- Optional active/idle texture submission rates; disabled by default.
+
+
+TB03 validated interaction patch
+- Normal mode supports direct Grip grab without entering Layout mode.
+- Valve Index / Knuckles is validated using legacy OpenVR Grip touch edge/latch detection; no SteamVR Action Manifest is installed.
+- Wrist dot can be repositioned with the opposite-hand Grip while staying wrist-local; offsets are saved to INI.
+- Backspace, Delete and arrow keys are single-fire to prevent accidental multi-character/multi-cursor movement.
+- PageUp/PageDown retain intentional long-press repeat.
+- SteamVR Dashboard remains independently operable during the validated interaction path.
+
+Retained Test Build 02 wrist input fix + TEST12 Dashboard arbitration
+- Normal scene wrist standby uses only DriveWristOverlayInteraction().
+- SteamVR native overlay-mouse input stays disabled during normal scene use.
+- While SteamVR Dashboard is visible, the wrist dot temporarily hands input to SteamVR native Mouse events and suspends the manual path.
+- Closing Dashboard restores the validated manual path; stale native mouse events are ignored again.
+- Calibrated hand-back facing now controls immediate dot visibility; a hidden dot is also non-interactive.
+- Full keyboard mode still uses SteamVR native Mouse input.
+
+Purpose
+- Restore V3.9.9-style immediate VR loop as the latency baseline.
+- Keep the V3.9.10 wrist-dot feature set.
+- Preserve the validated low-latency interaction path without changing frame pacing.
+
+Control Center additions
+- 關閉鍵盤: graceful named-event shutdown for rapid testing.
+- 即時效能監測: refreshes every 0.5 seconds.
+- 效能報告 CSV: opens perf_alpha_v3_9_10.csv.
+
+Report path
+%LOCALAPPDATA%\VRFullKeyboard\logs\perf_alpha_v3_9_10.csv
+
+Important
+This test build intentionally has no VR-loop sleep, WaitFrameSync, pose cache, or input/pose FPS cap. Adaptive texture updates are opt-in and affect only D3D rendering plus SetOverlayTexture; the default remains the TB02 immediate-submit baseline.
+
+Required VR regression
+- Single click -> expand the full keyboard.
+- Double click -> summon the keyboard.
+- Long press -> return to the saved position.
+- Repeat with controller ray and near-touch input.
+- Verify circular hit rejection at all four transparent corners.
+- In Layout mode, verify trigger-handle grab and Grip grab release independently.
+- Verify thumbstick vertical push/pull and horizontal scaling.
+- Verify Home/End/arrows and both Enter keys in a key-event tester.
+
+TEST12 focused regression
+- Put the calibrated dot on the back of the hand: face HMD -> visible; flip hand away -> hidden; face HMD again -> visible.
+- While Grip repositioning the dot, it must remain visible until release.
+- Open SteamVR Dashboard while wrist standby is active: the Dashboard itself must remain clickable.
+- With Dashboard still open, point at the wrist dot and click: single click must expand/summon according to the normal wrist gesture timing.
+- Close Dashboard and repeat wrist-dot click in VRChat/scene mode to verify the manual path still works exactly as the KnucklesGrip_VALIDATED baseline.
+
+
+TEST13 Dashboard Grip bypass
+- Keeps TEST12 native Dashboard Mouse as the exclusive Trigger/click path.
+- Restores Grip as a grab-only side channel while Dashboard is visible.
+- Mirrors Knuckles Grip ButtonTouch/ButtonUntouch events as a Dashboard fallback without an Action Manifest.
+- Wrist-dot Dashboard Grip is gated by SteamVR's current native pointer controller.
+- Expanded-keyboard Grip reuses the validated normal grab path with the same event fallback.
+- Trigger mouse-button events are suppressed only while a wrist-dot Grip drag is actively in progress.

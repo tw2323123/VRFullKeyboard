@@ -27,6 +27,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -37,7 +38,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 namespace {
 constexpr int TEX_W = 1920;
 constexpr int TEX_H = 660;
-constexpr float DEFAULT_OVERLAY_WIDTH_M = 1.68f;
+constexpr float DEFAULT_OVERLAY_WIDTH_M = 1.08f;
+constexpr float DEFAULT_OVERLAY_DISTANCE_M = 0.92f;
 struct UiSettings {
     float keyHeight = 70.0f;
     float keyUnit = 74.0f;
@@ -55,6 +57,10 @@ struct UiSettings {
     // V3.4 interaction controls.
     bool hapticEnabled = true;
     float hapticStrength = 0.35f;
+    bool hoverHapticsEnabled = true;
+    float hoverHapticScale = 0.18f;
+    bool showInteractionPointer = true;
+    float pointerScale = 1.0f;
     bool repeatEnabled = true;
     float repeatDelay = 0.38f;
     float repeatRate = 0.070f;
@@ -64,11 +70,42 @@ struct UiSettings {
 
     // V3.4.3 wrist-dot controls.
     bool wristUseLeftHand = true;
+    bool startInWristStandby = true;
     float wristWidthMeters = 0.30f; // Legacy V3.4 setting; kept for INI compatibility.
-    float wristDotSizeMeters = 0.085f;
+    // Small launcher overlay. Size is the transparent square overlay width;
+    // the visible blue/white dot occupies only part of that square.
+    float wristDotSizeMeters = 0.045f;
     float wristDotAlpha = 0.88f;
+    // Controller-local calibration offsets. Defaults stay on the tracked grip
+    // origin instead of guessing a Quest/Index/Pico-specific wrist offset.
+    float wristDotOffsetX = 0.0f;
+    float wristDotOffsetY = 0.0f;
+    float wristDotOffsetZ = 0.0f;
+    // Logical circular hit mask, independent from the visible dot.  0.85
+    // means the clickable diameter uses 85% of the transparent square.
+    float wristHitScale = 0.85f;
     float wristDoubleClickSeconds = 0.30f;
     float wristLongPressSeconds = 0.75f;
+
+    // Reference-overlay-inspired window handling. Zero damping keeps the TB02
+    // controller-relative, one-to-one path.  Non-zero values opt into
+    // independent position / rotation smoothing while grabbing.
+    bool layoutGripGrabEnabled = true;
+    bool autoFaceOnRelease = true;
+    float grabPositionDamping = 0.0f;
+    float grabRotationDamping = 0.0f;
+    float pushPullSpeed = 0.35f;
+    float scaleSpeed = 0.40f;
+
+    // OpenVR compositor curvature for the expanded keyboard only.
+    bool curvedOverlay = true;
+    float overlayCurvature = 0.12f;
+
+    // Texture updates may be capped independently from the uncapped input /
+    // pose loop.  Off preserves the exact TB02 low-latency baseline.
+    bool adaptiveTextureUpdates = false;
+    float activeTextureFps = 120.0f;
+    float idleTextureFps = 30.0f;
 
     // Font rendering mode. 0 = Clear (Segoe UI + Microsoft JhengHei), 1 = Standard JhengHei.
     int fontStyle = 0;
@@ -95,6 +132,8 @@ struct UiSettings {
 };
 
 UiSettings g_ui;
+float g_widthMeters = DEFAULT_OVERLAY_WIDTH_M;
+float g_distance = DEFAULT_OVERLAY_DISTANCE_M;
 bool g_editorMode = false;
 bool g_autoSave = true;
 ImVec2 g_previewKeyboardArea(0.0f, 0.0f);
@@ -105,6 +144,201 @@ bool g_vrClickPending = false;
 std::chrono::steady_clock::time_point g_vrClickEventTime{};
 std::chrono::steady_clock::time_point g_lastVrInteraction = std::chrono::steady_clock::now();
 float g_overlayAlpha = 1.0f;
+bool g_forceTextureSubmit = true;
+std::chrono::steady_clock::time_point g_lastTextureSubmit{};
+bool g_pointerVisible = false;
+ImGuiID g_hoverHapticItem = 0;
+bool g_hoverHapticSeenThisFrame = false;
+
+// Alpha V3.9.10 Test Build diagnostics. These timers observe the original
+// immediate V3.9.9-style pose/input loop without adding sleeps, pose caches or
+// WaitFrameSync. TB03's optional scheduler is texture-only and defaults off.
+struct PerfFrameSample {
+    float trackingMs = 0.0f;
+    float eventsMs = 0.0f;
+    float logicMs = 0.0f;
+    float imguiMs = 0.0f;
+    float d3dMs = 0.0f;
+    float submitMs = 0.0f;
+    float totalMs = 0.0f;
+};
+
+struct PerfSummary {
+    float avgTrackingMs = 0.0f, maxTrackingMs = 0.0f;
+    float avgEventsMs = 0.0f, maxEventsMs = 0.0f;
+    float avgLogicMs = 0.0f, maxLogicMs = 0.0f;
+    float avgImGuiMs = 0.0f, maxImGuiMs = 0.0f;
+    float avgD3DMs = 0.0f, maxD3DMs = 0.0f;
+    float avgSubmitMs = 0.0f, maxSubmitMs = 0.0f;
+    float avgTotalMs = 0.0f, maxTotalMs = 0.0f;
+    float cpuPercent = 0.0f;
+    float loopsPerSec = 0.0f;
+    size_t sampleCount = 0;
+    vr::EVROverlayError lastSubmitError = vr::VROverlayError_None;
+};
+
+std::array<PerfFrameSample, 240> g_perfFrames{};
+size_t g_perfFrameWrite = 0;
+size_t g_perfFrameCount = 0;
+PerfSummary g_perfSummary{};
+uint64_t g_perfLoopsSinceSummary = 0;
+std::chrono::steady_clock::time_point g_perfLastSummary{};
+
+constexpr wchar_t kControlExitEventName[] = L"Local\\VRFullKeyboard.Exit.AlphaV3_9_10";
+HANDLE g_controlExitEvent = nullptr;
+
+static double FileTimeSeconds(const FILETIME& ft) {
+    ULARGE_INTEGER u{};
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<double>(u.QuadPart) / 10000000.0;
+}
+
+static std::filesystem::path PerfLogDirectory() {
+    wchar_t localAppData[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    std::filesystem::path dir;
+    if (n > 0 && n < MAX_PATH) dir = std::filesystem::path(localAppData) / L"VRFullKeyboard" / L"logs";
+    else dir = std::filesystem::temp_directory_path() / L"VRFullKeyboard";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+static std::filesystem::path PerfLogPath() {
+    return PerfLogDirectory() / L"perf_alpha_v3_9_10.csv";
+}
+
+static std::filesystem::path PerfLivePath() {
+    return PerfLogDirectory() / L"perf_live_alpha_v3_9_10.ini";
+}
+
+static float SampleProcessCpuPercent() {
+    static bool initialized = false;
+    static double prevCpuSec = 0.0;
+    static auto prevWall = std::chrono::steady_clock::now();
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) return 0.0f;
+    const double cpuSec = FileTimeSeconds(kernel) + FileTimeSeconds(user);
+    const auto now = std::chrono::steady_clock::now();
+    if (!initialized) {
+        initialized = true;
+        prevCpuSec = cpuSec;
+        prevWall = now;
+        return 0.0f;
+    }
+    const double wallSec = std::chrono::duration<double>(now - prevWall).count();
+    const double cpuDelta = cpuSec - prevCpuSec;
+    prevCpuSec = cpuSec;
+    prevWall = now;
+    if (wallSec <= 0.0) return 0.0f;
+    DWORD cores = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (cores == 0) cores = 1;
+    return static_cast<float>(std::clamp(cpuDelta / wallSec / static_cast<double>(cores) * 100.0, 0.0, 100.0));
+}
+
+static void PushPerfSample(const PerfFrameSample& sample) {
+    g_perfFrames[g_perfFrameWrite] = sample;
+    g_perfFrameWrite = (g_perfFrameWrite + 1) % g_perfFrames.size();
+    g_perfFrameCount = (std::min)(g_perfFrameCount + 1, g_perfFrames.size());
+    ++g_perfLoopsSinceSummary;
+}
+
+static void WritePerfLiveSnapshot(const PerfSummary& out) {
+    const auto live = PerfLivePath();
+    auto temp = live;
+    temp += L".tmp";
+    std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+    if (!file) return;
+    file << std::fixed << std::setprecision(4)
+         << "display_version=" << VRFK_DISPLAY_VERSION << " " << VRFK_TEST_BUILD_LABEL << '\n'
+         << "pid=" << GetCurrentProcessId() << '\n'
+         << "cpu_percent=" << out.cpuPercent << '\n'
+         << "loops_per_sec=" << out.loopsPerSec << '\n'
+         << "samples=" << out.sampleCount << '\n'
+         << "avg_tracking_ms=" << out.avgTrackingMs << '\n'
+         << "max_tracking_ms=" << out.maxTrackingMs << '\n'
+         << "avg_events_ms=" << out.avgEventsMs << '\n'
+         << "max_events_ms=" << out.maxEventsMs << '\n'
+         << "avg_logic_ms=" << out.avgLogicMs << '\n'
+         << "max_logic_ms=" << out.maxLogicMs << '\n'
+         << "avg_imgui_ms=" << out.avgImGuiMs << '\n'
+         << "max_imgui_ms=" << out.maxImGuiMs << '\n'
+         << "avg_d3d_ms=" << out.avgD3DMs << '\n'
+         << "max_d3d_ms=" << out.maxD3DMs << '\n'
+         << "avg_submit_ms=" << out.avgSubmitMs << '\n'
+         << "max_submit_ms=" << out.maxSubmitMs << '\n'
+         << "avg_total_ms=" << out.avgTotalMs << '\n'
+         << "max_total_ms=" << out.maxTotalMs << '\n'
+         << "submit_error=" << static_cast<int>(out.lastSubmitError) << '\n';
+    file.close();
+    MoveFileExW(temp.wstring().c_str(), live.wstring().c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+static void UpdatePerfSummary(vr::EVROverlayError lastSubmitError) {
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    if (g_perfLastSummary.time_since_epoch().count() != 0 &&
+        now - g_perfLastSummary < std::chrono::milliseconds(500)) return;
+    const double windowSec = g_perfLastSummary.time_since_epoch().count() == 0
+        ? 0.5 : (std::max)(0.001, std::chrono::duration<double>(now - g_perfLastSummary).count());
+    g_perfLastSummary = now;
+
+    PerfSummary out{};
+    out.sampleCount = g_perfFrameCount;
+    out.lastSubmitError = lastSubmitError;
+    auto add = [](float& avg, float& mx, float value) {
+        avg += value;
+        mx = (std::max)(mx, value);
+    };
+    for (size_t i = 0; i < g_perfFrameCount; ++i) {
+        const auto& f = g_perfFrames[i];
+        add(out.avgTrackingMs, out.maxTrackingMs, f.trackingMs);
+        add(out.avgEventsMs, out.maxEventsMs, f.eventsMs);
+        add(out.avgLogicMs, out.maxLogicMs, f.logicMs);
+        add(out.avgImGuiMs, out.maxImGuiMs, f.imguiMs);
+        add(out.avgD3DMs, out.maxD3DMs, f.d3dMs);
+        add(out.avgSubmitMs, out.maxSubmitMs, f.submitMs);
+        add(out.avgTotalMs, out.maxTotalMs, f.totalMs);
+    }
+    if (g_perfFrameCount > 0) {
+        const float inv = 1.0f / static_cast<float>(g_perfFrameCount);
+        out.avgTrackingMs *= inv;
+        out.avgEventsMs *= inv;
+        out.avgLogicMs *= inv;
+        out.avgImGuiMs *= inv;
+        out.avgD3DMs *= inv;
+        out.avgSubmitMs *= inv;
+        out.avgTotalMs *= inv;
+    }
+    out.cpuPercent = SampleProcessCpuPercent();
+    out.loopsPerSec = static_cast<float>(g_perfLoopsSinceSummary / windowSec);
+    g_perfLoopsSinceSummary = 0;
+    g_perfSummary = out;
+
+    const auto logPath = PerfLogPath();
+    std::error_code ec;
+    const bool needHeader = !std::filesystem::exists(logPath, ec) || std::filesystem::file_size(logPath, ec) == 0;
+    std::ofstream log(logPath, std::ios::app);
+    if (log) {
+        if (needHeader) {
+            log << "timestamp_ms,version,cpu_percent,loops_per_sec,samples,avg_tracking_ms,max_tracking_ms,avg_events_ms,max_events_ms,avg_logic_ms,max_logic_ms,avg_imgui_ms,max_imgui_ms,avg_d3d_ms,max_d3d_ms,avg_submit_ms,max_submit_ms,avg_total_ms,max_total_ms,submit_error\n";
+        }
+        const auto systemMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        log << systemMs << ',' << VRFK_DISPLAY_VERSION << '-' << VRFK_TEST_BUILD_LABEL << ','
+            << out.cpuPercent << ',' << out.loopsPerSec << ',' << out.sampleCount << ','
+            << out.avgTrackingMs << ',' << out.maxTrackingMs << ','
+            << out.avgEventsMs << ',' << out.maxEventsMs << ','
+            << out.avgLogicMs << ',' << out.maxLogicMs << ','
+            << out.avgImGuiMs << ',' << out.maxImGuiMs << ','
+            << out.avgD3DMs << ',' << out.maxD3DMs << ','
+            << out.avgSubmitMs << ',' << out.maxSubmitMs << ','
+            << out.avgTotalMs << ',' << out.maxTotalMs << ','
+            << static_cast<int>(out.lastSubmitError) << '\n';
+    }
+    WritePerfLiveSnapshot(out);
+}
 ImGuiID g_repeatActiveId = 0;
 double g_repeatNextTime = 0.0;
 
@@ -198,16 +432,81 @@ ImVec2 g_desktopDragStartMouse(0.0f, 0.0f);
 float g_desktopDragStartOffsetX = 0.0f;
 float g_desktopDragStartOffsetY = 0.0f;
 
+enum class InteractionMode { Normal, Layout };
+enum class GrabInputSource { None, TriggerHandle, GripLayout };
+
 // SteamVR controller grab state. The grab handle moves the whole overlay,
 // and releasing it converts the overlay back to a world-fixed transform.
+// Layout mode additionally supports grip-anywhere grabbing plus thumbstick
+// push/pull and scale without changing the normal keyboard interaction path.
+InteractionMode g_interactionMode = InteractionMode::Normal;
 bool g_vrGrabActive = false;
 vr::TrackedDeviceIndex_t g_vrGrabDevice = vr::k_unTrackedDeviceIndexInvalid;
 vr::TrackedDeviceIndex_t g_lastPointerDevice = vr::k_unTrackedDeviceIndexInvalid;
 vr::HmdMatrix34_t g_vrGrabRelative{};
+vr::HmdMatrix34_t g_vrGrabSmoothedAbsolute{};
+GrabInputSource g_vrGrabInputSource = GrabInputSource::None;
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_layoutGripWasDown{};
+std::chrono::steady_clock::time_point g_vrGrabLastUpdate{};
+
+// TB03 grip compatibility state.  Do not install a SteamVR Action Manifest:
+// that previously stole Dashboard/system UI input on the user's runtime.
+// Instead combine legacy button events, the classic controller-state bit,
+// and (for Touch/OpenXR-style mappings) a second analog Trigger-type axis.
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_gripEventKnown{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_gripEventDown{};
+// Knuckles' validated gesture is based on capacitive Grip touch rather than
+// squeeze pressure. Keep an event-backed mirror because SteamVR Dashboard can
+// own legacy controller focus while still forwarding touch transitions.
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_gripTouchEventKnown{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_gripTouchEventDown{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_gripAnalogDown{};
+
+// Valve Index / Knuckles compatibility: squeeze force is not exposed through the
+// legacy controller-state API on the user's runtime. It does, however, expose
+// k_EButton_Grip in ulButtonTouched. Use that capacitive contact as a safe
+// fallback without installing a SteamVR Action Manifest. The gesture is
+// intentionally edge/latch based: the user must fully release the grip contact
+// once before closing the hand to start a grab, which avoids grabbing
+// immediately just because the controller was already being held at startup.
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_knucklesGripInitialized{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_knucklesGripRawTouch{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_knucklesGripStableTouch{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_knucklesGripArmed{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_knucklesGripActive{};
+std::array<std::chrono::steady_clock::time_point, vr::k_unMaxTrackedDeviceCount> g_knucklesGripRawChanged{};
+
+std::array<int, vr::k_unMaxTrackedDeviceCount> g_gripAnalogAxis = [] {
+    std::array<int, vr::k_unMaxTrackedDeviceCount> result{};
+    result.fill(-2); // -2 unknown, -1 unsupported
+    return result;
+}();
+
+// Wrist-dot calibration grab is separate from the full keyboard grab.  The
+// dot remains wrist-bound; dragging only rewrites wristDotOffset X/Y/Z.
+bool g_wristGripGrabActive = false;
+vr::TrackedDeviceIndex_t g_wristGripGrabDevice = vr::k_unTrackedDeviceIndexInvalid;
+vr::HmdMatrix34_t g_wristGripGrabRelative{};
+std::array<bool, vr::k_unMaxTrackedDeviceCount> g_wristGripWasDown{};
 
 // V3.4 wrist standby / summon state. These positions are session-only because
 // SteamVR Standing-space coordinates may change between room setup sessions.
 bool g_wristStandby = false;
+// Current device selected for the wrist launcher. Unlike the old role-only
+// binding, V3.9.8 can also recover a hand by its physical left/right position.
+vr::TrackedDeviceIndex_t g_wristTrackedDevice = vr::k_unTrackedDeviceIndexInvalid;
+bool g_wristUsingHmdFallback = false;
+vr::HmdMatrix34_t g_wristAbsoluteTransform{};
+bool g_wristAbsoluteTransformValid = false;
+// The launcher quad is billboarded toward the HMD, so OpenVR backface culling
+// cannot tell whether the *physical* back of the hand is facing the user.
+// Derive that visibility from the calibrated wrist-local offset instead.
+bool g_wristDotFacingViewer = true;
+// Outside the SteamVR Dashboard the validated wrist path owns pointer/Trigger
+// input. While the Dashboard is visible, SteamVR must own mouse routing or its
+// system UI input focus prevents the raw/manual Trigger path from clicking.
+bool g_wristDashboardNativeInput = false;
+
 vr::HmdMatrix34_t g_returnWorldTransform{};
 bool g_returnWorldTransformValid = false;
 float g_returnWidthMeters = DEFAULT_OVERLAY_WIDTH_M;
@@ -321,18 +620,46 @@ struct ModifierState {
 ModifierState g_mods;
 bool g_previewMode = false;
 
-void SendVk(WORD vk, bool down) {
+bool IsExtendedVirtualKey(WORD vk) {
+    switch (vk) {
+        case VK_RMENU:
+        case VK_RCONTROL:
+        case VK_INSERT:
+        case VK_DELETE:
+        case VK_HOME:
+        case VK_END:
+        case VK_PRIOR:
+        case VK_NEXT:
+        case VK_LEFT:
+        case VK_UP:
+        case VK_RIGHT:
+        case VK_DOWN:
+        case VK_NUMLOCK:
+        case VK_CANCEL:
+        case VK_SNAPSHOT:
+        case VK_DIVIDE:
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_APPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void SendVk(WORD vk, bool down, bool forceExtended = false) {
     if (g_previewMode) return;
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = vk;
-    input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    input.ki.dwFlags = (down ? 0 : KEYEVENTF_KEYUP) |
+                       ((forceExtended || IsExtendedVirtualKey(vk)) ? KEYEVENTF_EXTENDEDKEY : 0);
     SendInput(1, &input, sizeof(INPUT));
 }
 
-void SendTapRaw(WORD vk) {
-    SendVk(vk, true);
-    SendVk(vk, false);
+void SendTapRaw(WORD vk, bool forceExtended = false) {
+    SendVk(vk, true, forceExtended);
+    SendVk(vk, false, forceExtended);
 }
 
 void PressActiveModifiers() {
@@ -349,9 +676,9 @@ void ReleaseActiveModifiers() {
     if (g_mods.ctrl)  SendVk(VK_CONTROL, false);
 }
 
-void SendKey(WORD vk) {
+void SendKey(WORD vk, bool forceExtended = false) {
     PressActiveModifiers();
-    SendTapRaw(vk);
+    SendTapRaw(vk, forceExtended);
     ReleaseActiveModifiers();
     g_mods.clear();
 }
@@ -875,13 +1202,28 @@ void PulseHaptic(float scale = 1.0f) {
     sys->TriggerHapticPulse(g_lastPointerDevice, 0, duration);
 }
 
+void TrackHoverHaptic(ImGuiID itemId, bool hovered) {
+    if (!hovered) return;
+    g_hoverHapticSeenThisFrame = true;
+    if (g_hoverHapticItem == itemId) return;
+    g_hoverHapticItem = itemId;
+    if (g_ui.hoverHapticsEnabled) PulseHaptic(g_ui.hoverHapticScale);
+}
+
+void FinishHoverHapticsFrame() {
+    if (!g_hoverHapticSeenThisFrame) g_hoverHapticItem = 0;
+    g_hoverHapticSeenThisFrame = false;
+}
+
 bool SelectedButton(const char* label, bool selected, ImVec2 size) {
     if (selected) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.48f, 0.78f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.56f, 0.90f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.40f, 0.68f, 1.0f));
     }
+    const ImGuiID itemId = ImGui::GetID(label);
     const bool clicked = ImGui::Button(label, size);
+    TrackHoverHaptic(itemId, ImGui::IsItemHovered());
     if (selected) ImGui::PopStyleColor(3);
     return clicked;
 }
@@ -898,6 +1240,7 @@ bool EditorCenteredButton(const char* label, ImVec2 size, float visualYOffset = 
     ImGui::PushID(label);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const bool clicked = ImGui::InvisibleButton("##editor_centered_button", size);
+    const ImGuiID itemId = ImGui::GetID("##editor_centered_button");
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
 
@@ -917,6 +1260,7 @@ bool EditorCenteredButton(const char* label, ImVec2 size, float visualYOffset = 
         p0.x + (size.x - textSize.x) * 0.5f,
         p0.y + (size.y - textSize.y) * 0.5f + visualYOffset);
     dl->AddText(textPos, textColor, label);
+    TrackHoverHaptic(itemId, hovered);
     ImGui::PopID();
     return clicked;
 }
@@ -993,6 +1337,7 @@ bool PhysicalKeyButton(const char* id,
     const bool hovered = ImGui::IsItemHovered();
     const bool held = ImGui::IsItemActive();
     const ImGuiID itemId = ImGui::GetID("key");
+    TrackHoverHaptic(itemId, hovered && !activated);
     const double nowTime = ImGui::GetTime();
     if (activated && repeatable) {
         g_repeatActiveId = itemId;
@@ -1101,7 +1446,7 @@ void DrawAlphaKeyboard() {
     Key("0", "0", '0', 1.0f, KeyZone::Green, ")", "ㄢ"); SameKey();
     Key("minus", "-", VK_OEM_MINUS, 1.0f, KeyZone::Blue, "_", "ㄦ"); SameKey();
     Key("equals", "=", VK_OEM_PLUS, 1.0f, KeyZone::Blue, "+"); SameKey();
-    Key("backspace", "BACKSPACE", VK_BACK, 2.05f, KeyZone::Blue, "", "", true);
+    Key("backspace", "BACKSPACE", VK_BACK, 2.05f, KeyZone::Blue);
 
     Key("tab", "TAB", VK_TAB, 1.55f, KeyZone::Red); SameKey();
     Key("Q", "Q", 'Q', 1.0f, KeyZone::Red, "", "ㄆ"); SameKey();
@@ -1160,17 +1505,17 @@ void DrawNavigation() {
     Key("ins", "INSERT", VK_INSERT, 1.0f, KeyZone::Blue); SameKey();
     Key("home", "HOME", VK_HOME, 1.0f, KeyZone::Blue); SameKey();
     Key("pgup", "PAGE\nUP", VK_PRIOR, 1.0f, KeyZone::Blue, "", "", true);
-    Key("del", "DELETE", VK_DELETE, 1.0f, KeyZone::Blue, "", "", true); SameKey();
+    Key("del", "DELETE", VK_DELETE, 1.0f, KeyZone::Blue); SameKey();
     Key("end", "END", VK_END, 1.0f, KeyZone::Blue); SameKey();
     Key("pgdn", "PAGE\nDOWN", VK_NEXT, 1.0f, KeyZone::Blue, "", "", true);
 
     ImGui::Dummy(ImVec2(1, 8 * KeyboardScale()));
     ImGui::Indent((W(1.0f) + g_ui.gap) * KeyboardScale());
-    Key("up", "↑", VK_UP, 1.0f, KeyZone::Blue, "", "", true);
+    Key("up", "↑", VK_UP, 1.0f, KeyZone::Blue);
     ImGui::Unindent((W(1.0f) + g_ui.gap) * KeyboardScale());
-    Key("left", "←", VK_LEFT, 1.0f, KeyZone::Blue, "", "", true); SameKey();
-    Key("down", "↓", VK_DOWN, 1.0f, KeyZone::Blue, "", "", true); SameKey();
-    Key("right", "→", VK_RIGHT, 1.0f, KeyZone::Blue, "", "", true);
+    Key("left", "←", VK_LEFT, 1.0f, KeyZone::Blue); SameKey();
+    Key("down", "↓", VK_DOWN, 1.0f, KeyZone::Blue); SameKey();
+    Key("right", "→", VK_RIGHT, 1.0f, KeyZone::Blue);
 }
 
 void Q9NumpadKey(const char* id, const char* primary, WORD vk, float units, const char* normalShifted = "") {
@@ -1208,7 +1553,9 @@ void DrawNumpad() {
     Key("numdot", ".", VK_DECIMAL, 1.0f, KeyZone::Purple, "DEL");
     ImGui::EndGroup();
     SameKey();
-    if (PhysicalKeyButton("numenter", "ENTER", "", "", ImVec2(W(1.0f), g_ui.keyHeight * 2.0f + g_ui.gap), KeyZone::Purple, false, true)) SendKey(VK_RETURN);
+    // Numpad Enter shares VK_RETURN with the main Enter key but is identified
+    // by the Windows extended-key bit. Keep the two physical keys distinct.
+    if (PhysicalKeyButton("numenter", "ENTER", "", "", ImVec2(W(1.0f), g_ui.keyHeight * 2.0f + g_ui.gap), KeyZone::Purple, false, true)) SendKey(VK_RETURN, true);
 }
 
 
@@ -1222,6 +1569,8 @@ std::filesystem::path SettingsPath() {
 
 void ResetUiSettings() {
     g_ui = UiSettings{};
+    g_widthMeters = DEFAULT_OVERLAY_WIDTH_M;
+    g_distance = DEFAULT_OVERLAY_DISTANCE_M;
     g_shortcutBanks = kDefaultShortcutBanks;
     g_shortcutBankIndex = 0;
     g_macroQueue.clear();
@@ -1266,6 +1615,10 @@ void SaveSettings() {
     out << "keyBorderThickness=" << g_ui.keyBorderThickness << '\n';
     out << "hapticEnabled=" << (g_ui.hapticEnabled ? 1 : 0) << '\n';
     out << "hapticStrength=" << g_ui.hapticStrength << '\n';
+    out << "hoverHapticsEnabled=" << (g_ui.hoverHapticsEnabled ? 1 : 0) << '\n';
+    out << "hoverHapticScale=" << g_ui.hoverHapticScale << '\n';
+    out << "showInteractionPointer=" << (g_ui.showInteractionPointer ? 1 : 0) << '\n';
+    out << "pointerScale=" << g_ui.pointerScale << '\n';
     out << "repeatEnabled=" << (g_ui.repeatEnabled ? 1 : 0) << '\n';
     out << "repeatDelay=" << g_ui.repeatDelay << '\n';
     out << "repeatRate=" << g_ui.repeatRate << '\n';
@@ -1273,11 +1626,29 @@ void SaveSettings() {
     out << "autoFadeSeconds=" << g_ui.autoFadeSeconds << '\n';
     out << "autoFadeAlpha=" << g_ui.autoFadeAlpha << '\n';
     out << "wristUseLeftHand=" << (g_ui.wristUseLeftHand ? 1 : 0) << '\n';
+    out << "startInWristStandby=" << (g_ui.startInWristStandby ? 1 : 0) << '\n';
+    out << "overlayWidthMeters=" << g_widthMeters << '\n';
+    out << "overlayDistanceMeters=" << g_distance << '\n';
     out << "wristWidthMeters=" << g_ui.wristWidthMeters << '\n';
     out << "wristDotSizeMeters=" << g_ui.wristDotSizeMeters << '\n';
     out << "wristDotAlpha=" << g_ui.wristDotAlpha << '\n';
+    out << "wristDotOffsetX=" << g_ui.wristDotOffsetX << '\n';
+    out << "wristDotOffsetY=" << g_ui.wristDotOffsetY << '\n';
+    out << "wristDotOffsetZ=" << g_ui.wristDotOffsetZ << '\n';
+    out << "wristHitScale=" << g_ui.wristHitScale << '\n';
     out << "wristDoubleClickSeconds=" << g_ui.wristDoubleClickSeconds << '\n';
     out << "wristLongPressSeconds=" << g_ui.wristLongPressSeconds << '\n';
+    out << "layoutGripGrabEnabled=" << (g_ui.layoutGripGrabEnabled ? 1 : 0) << '\n';
+    out << "autoFaceOnRelease=" << (g_ui.autoFaceOnRelease ? 1 : 0) << '\n';
+    out << "grabPositionDamping=" << g_ui.grabPositionDamping << '\n';
+    out << "grabRotationDamping=" << g_ui.grabRotationDamping << '\n';
+    out << "pushPullSpeed=" << g_ui.pushPullSpeed << '\n';
+    out << "scaleSpeed=" << g_ui.scaleSpeed << '\n';
+    out << "curvedOverlay=" << (g_ui.curvedOverlay ? 1 : 0) << '\n';
+    out << "overlayCurvature=" << g_ui.overlayCurvature << '\n';
+    out << "adaptiveTextureUpdates=" << (g_ui.adaptiveTextureUpdates ? 1 : 0) << '\n';
+    out << "activeTextureFps=" << g_ui.activeTextureFps << '\n';
+    out << "idleTextureFps=" << g_ui.idleTextureFps << '\n';
     out << "fontStyle=" << g_ui.fontStyle << '\n';
     out << "q9Mode=" << (g_ui.q9Mode ? 1 : 0) << '\n';
     out << "autoCheckUpdates=" << (g_ui.autoCheckUpdates ? 1 : 0) << '\n';
@@ -1310,6 +1681,11 @@ void SaveSettings() {
 void LoadSettings() {
     std::ifstream in(SettingsPath());
     if (!in) return;
+    // V3.9.9 migration marker: older INIs have wristDotSizeMeters but no
+    // calibration keys. That lets us safely replace the oversized legacy
+    // launcher default once without touching later user calibration.
+    bool hasWristDotCalibrationKeys = false;
+    bool loadedLegacyWristDotSize = false;
     std::string line;
     while (std::getline(in, line)) {
         const auto eq = line.find('=');
@@ -1378,6 +1754,10 @@ void LoadSettings() {
         else if (key == "keyBorderThickness") g_ui.keyBorderThickness = value;
         else if (key == "hapticEnabled") g_ui.hapticEnabled = value > 0.5f;
         else if (key == "hapticStrength") g_ui.hapticStrength = value;
+        else if (key == "hoverHapticsEnabled") g_ui.hoverHapticsEnabled = value > 0.5f;
+        else if (key == "hoverHapticScale") g_ui.hoverHapticScale = value;
+        else if (key == "showInteractionPointer") g_ui.showInteractionPointer = value > 0.5f;
+        else if (key == "pointerScale") g_ui.pointerScale = value;
         else if (key == "repeatEnabled") g_ui.repeatEnabled = value > 0.5f;
         else if (key == "repeatDelay") g_ui.repeatDelay = value;
         else if (key == "repeatRate") g_ui.repeatRate = value;
@@ -1385,11 +1765,29 @@ void LoadSettings() {
         else if (key == "autoFadeSeconds") g_ui.autoFadeSeconds = value;
         else if (key == "autoFadeAlpha") g_ui.autoFadeAlpha = value;
         else if (key == "wristUseLeftHand") g_ui.wristUseLeftHand = value > 0.5f;
+        else if (key == "startInWristStandby") g_ui.startInWristStandby = value > 0.5f;
+        else if (key == "overlayWidthMeters") g_widthMeters = value;
+        else if (key == "overlayDistanceMeters") g_distance = value;
         else if (key == "wristWidthMeters") g_ui.wristWidthMeters = value;
-        else if (key == "wristDotSizeMeters") g_ui.wristDotSizeMeters = value;
+        else if (key == "wristDotSizeMeters") { g_ui.wristDotSizeMeters = value; loadedLegacyWristDotSize = true; }
         else if (key == "wristDotAlpha") g_ui.wristDotAlpha = value;
+        else if (key == "wristDotOffsetX") { g_ui.wristDotOffsetX = value; hasWristDotCalibrationKeys = true; }
+        else if (key == "wristDotOffsetY") { g_ui.wristDotOffsetY = value; hasWristDotCalibrationKeys = true; }
+        else if (key == "wristDotOffsetZ") { g_ui.wristDotOffsetZ = value; hasWristDotCalibrationKeys = true; }
+        else if (key == "wristHitScale") g_ui.wristHitScale = value;
         else if (key == "wristDoubleClickSeconds") g_ui.wristDoubleClickSeconds = value;
         else if (key == "wristLongPressSeconds") g_ui.wristLongPressSeconds = value;
+        else if (key == "layoutGripGrabEnabled") g_ui.layoutGripGrabEnabled = value > 0.5f;
+        else if (key == "autoFaceOnRelease") g_ui.autoFaceOnRelease = value > 0.5f;
+        else if (key == "grabPositionDamping") g_ui.grabPositionDamping = value;
+        else if (key == "grabRotationDamping") g_ui.grabRotationDamping = value;
+        else if (key == "pushPullSpeed") g_ui.pushPullSpeed = value;
+        else if (key == "scaleSpeed") g_ui.scaleSpeed = value;
+        else if (key == "curvedOverlay") g_ui.curvedOverlay = value > 0.5f;
+        else if (key == "overlayCurvature") g_ui.overlayCurvature = value;
+        else if (key == "adaptiveTextureUpdates") g_ui.adaptiveTextureUpdates = value > 0.5f;
+        else if (key == "activeTextureFps") g_ui.activeTextureFps = value;
+        else if (key == "idleTextureFps") g_ui.idleTextureFps = value;
         else if (key == "fontStyle") g_ui.fontStyle = static_cast<int>(value);
         else if (key == "q9Mode") g_ui.q9Mode = value > 0.5f;
         else if (key == "autoCheckUpdates") g_ui.autoCheckUpdates = value > 0.5f;
@@ -1424,6 +1822,16 @@ void LoadSettings() {
         else if (key == "zonePurpleG") g_ui.zonePurple[1] = value;
         else if (key == "zonePurpleB") g_ui.zonePurple[2] = value;
     }
+    // Existing 3.9.7/3.9.8 users commonly carry the old 0.085 m value.
+    // No calibration keys means this is an old-format INI, so migrate it to
+    // the new compact launcher. A 3.9.9+ INI keeps the user's chosen size.
+    if (loadedLegacyWristDotSize && !hasWristDotCalibrationKeys) {
+        g_ui.wristDotSizeMeters = 0.045f;
+        g_ui.wristDotOffsetX = 0.0f;
+        g_ui.wristDotOffsetY = 0.0f;
+        g_ui.wristDotOffsetZ = 0.0f;
+    }
+
     g_ui.keyHeight = std::clamp(g_ui.keyHeight, 58.0f, 82.0f);
     g_ui.keyUnit = std::clamp(g_ui.keyUnit, 64.0f, 82.0f);
     g_ui.gap = std::clamp(g_ui.gap, 2.0f, 12.0f);
@@ -1439,15 +1847,31 @@ void LoadSettings() {
     g_ui.keyCornerRadius = std::clamp(g_ui.keyCornerRadius, 0.0f, 18.0f);
     g_ui.keyBorderThickness = std::clamp(g_ui.keyBorderThickness, 0.5f, 5.0f);
     g_ui.hapticStrength = std::clamp(g_ui.hapticStrength, 0.05f, 1.0f);
+    g_ui.hoverHapticScale = std::clamp(g_ui.hoverHapticScale, 0.05f, 0.50f);
+    g_ui.pointerScale = std::clamp(g_ui.pointerScale, 0.50f, 2.50f);
     g_ui.repeatDelay = std::clamp(g_ui.repeatDelay, 0.20f, 0.80f);
     g_ui.repeatRate = std::clamp(g_ui.repeatRate, 0.035f, 0.20f);
     g_ui.autoFadeSeconds = std::clamp(g_ui.autoFadeSeconds, 2.0f, 60.0f);
     g_ui.autoFadeAlpha = std::clamp(g_ui.autoFadeAlpha, 0.08f, 0.80f);
+    g_widthMeters = std::clamp(g_widthMeters, 0.80f, 2.50f);
+    g_distance = std::clamp(g_distance, 0.45f, 1.50f);
     g_ui.wristWidthMeters = std::clamp(g_ui.wristWidthMeters, 0.18f, 0.48f);
-    g_ui.wristDotSizeMeters = std::clamp(g_ui.wristDotSizeMeters, 0.05f, 0.14f);
+    g_ui.wristDotSizeMeters = std::clamp(g_ui.wristDotSizeMeters, 0.025f, 0.080f);
     g_ui.wristDotAlpha = std::clamp(g_ui.wristDotAlpha, 0.30f, 1.00f);
+    g_ui.wristDotOffsetX = std::clamp(g_ui.wristDotOffsetX, -0.15f, 0.15f);
+    g_ui.wristDotOffsetY = std::clamp(g_ui.wristDotOffsetY, -0.15f, 0.15f);
+    g_ui.wristDotOffsetZ = std::clamp(g_ui.wristDotOffsetZ, -0.15f, 0.15f);
+    g_ui.wristHitScale = std::clamp(g_ui.wristHitScale, 0.45f, 1.00f);
     g_ui.wristDoubleClickSeconds = std::clamp(g_ui.wristDoubleClickSeconds, 0.18f, 0.55f);
     g_ui.wristLongPressSeconds = std::clamp(g_ui.wristLongPressSeconds, 0.40f, 1.50f);
+    g_ui.grabPositionDamping = std::clamp(g_ui.grabPositionDamping, 0.0f, 0.95f);
+    g_ui.grabRotationDamping = std::clamp(g_ui.grabRotationDamping, 0.0f, 0.95f);
+    g_ui.pushPullSpeed = std::clamp(g_ui.pushPullSpeed, 0.05f, 1.00f);
+    g_ui.scaleSpeed = std::clamp(g_ui.scaleSpeed, 0.05f, 1.00f);
+    g_ui.overlayCurvature = std::clamp(g_ui.overlayCurvature, 0.0f, 0.45f);
+    g_ui.activeTextureFps = std::clamp(g_ui.activeTextureFps, 45.0f, 144.0f);
+    g_ui.idleTextureFps = std::clamp(g_ui.idleTextureFps, 10.0f, 60.0f);
+    g_ui.idleTextureFps = (std::min)(g_ui.idleTextureFps, g_ui.activeTextureFps);
     g_ui.fontStyle = std::clamp(g_ui.fontStyle, 0, 1);
     g_shortcutBankIndex = (std::min)(g_shortcutBankIndex, g_shortcutBanks.size() - 1);
     auto clampColor = [](std::array<float, 3>& c) {
@@ -1469,9 +1893,28 @@ enum class AnchorMode { WorldFixed, HeadLocked, LeftHand, RightHand };
 AnchorMode g_anchor = AnchorMode::WorldFixed;
 vr::HmdMatrix34_t g_worldTransform{};
 bool g_worldTransformValid = false;
-float g_widthMeters = DEFAULT_OVERLAY_WIDTH_M;
-float g_distance = 0.82f;
 bool g_running = true;
+
+static void EnsureControlExitEvent() {
+    if (g_controlExitEvent) return;
+    g_controlExitEvent = CreateEventW(nullptr, TRUE, FALSE, kControlExitEventName);
+    if (g_controlExitEvent) {
+        ResetEvent(g_controlExitEvent);
+        std::error_code ec;
+        std::filesystem::remove(PerfLivePath(), ec);
+    }
+}
+
+static bool ControlCenterRequestedExit() {
+    return g_controlExitEvent && WaitForSingleObject(g_controlExitEvent, 0) == WAIT_OBJECT_0;
+}
+
+static void CloseControlExitEvent() {
+    if (g_controlExitEvent) {
+        CloseHandle(g_controlExitEvent);
+        g_controlExitEvent = nullptr;
+    }
+}
 
 vr::HmdMatrix34_t MakeTransform(float x, float y, float z, float pitchDegrees = 0.0f) {
     const float p = pitchDegrees * 3.1415926535f / 180.0f;
@@ -1508,13 +1951,115 @@ vr::HmdMatrix34_t InverseRigid34(const vr::HmdMatrix34_t& m) {
     return r;
 }
 
+float DampingBlend(float damping, float dt) {
+    if (damping <= 0.0001f) return 1.0f;
+    const float retainedPer90HzFrame = std::clamp(damping, 0.0f, 0.95f);
+    return 1.0f - std::pow(retainedPer90HzFrame, std::clamp(dt, 0.0f, 0.05f) * 90.0f);
+}
+
+vr::HmdMatrix34_t BlendRigid34(const vr::HmdMatrix34_t& current,
+                               const vr::HmdMatrix34_t& target,
+                               float positionBlend,
+                               float rotationBlend) {
+    vr::HmdMatrix34_t out = current;
+    for (int row = 0; row < 3; ++row) {
+        out.m[row][3] += (target.m[row][3] - current.m[row][3]) * positionBlend;
+        for (int column = 0; column < 3; ++column) {
+            out.m[row][column] += (target.m[row][column] - current.m[row][column]) * rotationBlend;
+        }
+    }
+
+    // Re-orthonormalize the blended basis so the compositor always receives
+    // a rigid transform even after independent rotation damping.
+    auto normalize = [](float& x, float& y, float& z) {
+        const float len = std::sqrt(x * x + y * y + z * z);
+        if (len < 0.00001f) return false;
+        x /= len; y /= len; z /= len;
+        return true;
+    };
+
+    float zx = out.m[0][2], zy = out.m[1][2], zz = out.m[2][2];
+    if (!normalize(zx, zy, zz)) {
+        zx = target.m[0][2]; zy = target.m[1][2]; zz = target.m[2][2];
+        normalize(zx, zy, zz);
+    }
+
+    float xx = out.m[0][0], xy = out.m[1][0], xz = out.m[2][0];
+    const float xDotZ = xx * zx + xy * zy + xz * zz;
+    xx -= xDotZ * zx; xy -= xDotZ * zy; xz -= xDotZ * zz;
+    if (!normalize(xx, xy, xz)) {
+        xx = target.m[0][0]; xy = target.m[1][0]; xz = target.m[2][0];
+        const float fallbackDot = xx * zx + xy * zy + xz * zz;
+        xx -= fallbackDot * zx; xy -= fallbackDot * zy; xz -= fallbackDot * zz;
+        normalize(xx, xy, xz);
+    }
+
+    const float yx = zy * xz - zz * xy;
+    const float yy = zz * xx - zx * xz;
+    const float yz = zx * xy - zy * xx;
+    out.m[0][0] = xx; out.m[0][1] = yx; out.m[0][2] = zx;
+    out.m[1][0] = xy; out.m[1][1] = yy; out.m[1][2] = zy;
+    out.m[2][0] = xz; out.m[2][1] = yz; out.m[2][2] = zz;
+    return out;
+}
+
 bool GetAbsoluteDevicePose(vr::TrackedDeviceIndex_t device, vr::HmdMatrix34_t& out) {
     auto* sys = vr::VRSystem();
     if (!sys || device == vr::k_unTrackedDeviceIndexInvalid || device >= vr::k_unMaxTrackedDeviceCount) return false;
+
+    // Latency regression fix: query SteamVR at the moment the pose is needed.
+    // V3.9.10 cached one snapshot at frame start; together with frame sleeping,
+    // that made pointer/overlay transforms visibly trail the controller.
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount]{};
-    sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, poses, vr::k_unMaxTrackedDeviceCount);
+    sys->GetDeviceToAbsoluteTrackingPose(
+        vr::TrackingUniverseStanding,
+        0.0f,
+        poses,
+        vr::k_unMaxTrackedDeviceCount);
     if (!poses[device].bPoseIsValid) return false;
     out = poses[device].mDeviceToAbsoluteTracking;
+    return true;
+}
+
+bool FaceTransformTowardHmd(vr::HmdMatrix34_t& transform) {
+    vr::HmdMatrix34_t hmdPose{};
+    if (!GetAbsoluteDevicePose(vr::k_unTrackedDeviceIndex_Hmd, hmdPose)) return false;
+
+    const float px = transform.m[0][3];
+    const float py = transform.m[1][3];
+    const float pz = transform.m[2][3];
+    float zx = hmdPose.m[0][3] - px;
+    float zy = hmdPose.m[1][3] - py;
+    float zz = hmdPose.m[2][3] - pz;
+    const float zLength = std::sqrt(zx * zx + zy * zy + zz * zz);
+    if (zLength < 0.0001f) return false;
+    zx /= zLength; zy /= zLength; zz /= zLength;
+
+    // Prefer world-up so releasing a grab also levels the keyboard. Near the
+    // vertical singularity, fall back to the HMD's current right axis.
+    float xx = zz;
+    float xy = 0.0f;
+    float xz = -zx;
+    float xLength = std::sqrt(xx * xx + xz * xz);
+    if (xLength < 0.0001f) {
+        xx = hmdPose.m[0][0];
+        xy = hmdPose.m[1][0];
+        xz = hmdPose.m[2][0];
+        xLength = std::sqrt(xx * xx + xy * xy + xz * xz);
+    }
+    if (xLength < 0.0001f) return false;
+    xx /= xLength; xy /= xLength; xz /= xLength;
+
+    float yx = zy * xz - zz * xy;
+    float yy = zz * xx - zx * xz;
+    float yz = zx * xy - zy * xx;
+    const float yLength = std::sqrt(yx * yx + yy * yy + yz * yz);
+    if (yLength < 0.0001f) return false;
+    yx /= yLength; yy /= yLength; yz /= yLength;
+
+    transform.m[0][0] = xx; transform.m[0][1] = yx; transform.m[0][2] = zx;
+    transform.m[1][0] = xy; transform.m[1][1] = yy; transform.m[1][2] = zy;
+    transform.m[2][0] = xz; transform.m[2][1] = yz; transform.m[2][2] = zz;
     return true;
 }
 
@@ -1541,42 +2086,179 @@ bool ResolveAnchorRelative(AnchorMode mode, vr::TrackedDeviceIndex_t& device, vr
     return false;
 }
 
-bool ResolveWristRelative(vr::TrackedDeviceIndex_t& device, vr::HmdMatrix34_t& relative) {
+bool ResolveWristAbsolute(vr::TrackedDeviceIndex_t& device, vr::HmdMatrix34_t& absolute, bool& usingHmdFallback) {
     auto* sys = vr::VRSystem();
     if (!sys) return false;
 
-    const vr::ETrackedControllerRole primaryRole = g_ui.wristUseLeftHand
+    vr::HmdMatrix34_t hmdPose{};
+    if (!GetAbsoluteDevicePose(vr::k_unTrackedDeviceIndex_Hmd, hmdPose)) return false;
+
+    const bool wantLeft = g_ui.wristUseLeftHand;
+    const vr::ETrackedControllerRole desiredRole = wantLeft
         ? vr::TrackedControllerRole_LeftHand
         : vr::TrackedControllerRole_RightHand;
-    const vr::ETrackedControllerRole fallbackRole = g_ui.wristUseLeftHand
-        ? vr::TrackedControllerRole_RightHand
-        : vr::TrackedControllerRole_LeftHand;
 
-    device = sys->GetTrackedDeviceIndexForControllerRole(primaryRole);
-    if (device == vr::k_unTrackedDeviceIndexInvalid)
-        device = sys->GetTrackedDeviceIndexForControllerRole(fallbackRole);
+    vr::TrackedDeviceIndex_t selected = sys->GetTrackedDeviceIndexForControllerRole(desiredRole);
+    vr::HmdMatrix34_t controllerPose{};
+    bool selectedValid = selected != vr::k_unTrackedDeviceIndexInvalid &&
+                         sys->GetTrackedDeviceClass(selected) == vr::TrackedDeviceClass_Controller &&
+                         GetAbsoluteDevicePose(selected, controllerPose);
 
-    if (device == vr::k_unTrackedDeviceIndexInvalid) {
-        // Desktop-like fallback in VR if neither controller is currently tracked.
+    if (!selectedValid) {
+        // Some OpenXR->SteamVR controller stacks do not publish controller roles
+        // reliably while a scene application (for example VRChat) owns input.
+        // Recover the requested hand by comparing every tracked controller's
+        // physical position against the HMD's local right axis.
+        bool found = false;
+        float bestScore = wantLeft ? FLT_MAX : -FLT_MAX;
+        vr::TrackedDeviceIndex_t bestDevice = vr::k_unTrackedDeviceIndexInvalid;
+        vr::HmdMatrix34_t bestPose{};
+
+        const float hx = hmdPose.m[0][3];
+        const float hy = hmdPose.m[1][3];
+        const float hz = hmdPose.m[2][3];
+        // Column 0 is the HMD local +X/right axis in Standing space.
+        const float rx = hmdPose.m[0][0];
+        const float ry = hmdPose.m[1][0];
+        const float rz = hmdPose.m[2][0];
+
+        for (vr::TrackedDeviceIndex_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+            if (sys->GetTrackedDeviceClass(i) != vr::TrackedDeviceClass_Controller) continue;
+            vr::HmdMatrix34_t pose{};
+            if (!GetAbsoluteDevicePose(i, pose)) continue;
+
+            const float dx = pose.m[0][3] - hx;
+            const float dy = pose.m[1][3] - hy;
+            const float dz = pose.m[2][3] - hz;
+            const float sideScore = dx * rx + dy * ry + dz * rz;
+
+            if (!found || (wantLeft ? sideScore < bestScore : sideScore > bestScore)) {
+                found = true;
+                bestScore = sideScore;
+                bestDevice = i;
+                bestPose = pose;
+            }
+        }
+
+        if (found) {
+            selected = bestDevice;
+            controllerPose = bestPose;
+            selectedValid = true;
+        }
+    }
+
+    if (!selectedValid) {
+        // Keep a discoverable fallback while SteamVR is still establishing
+        // controller tracking. As soon as a real hand pose appears this
+        // function switches back automatically on the next frame.
         device = vr::k_unTrackedDeviceIndex_Hmd;
-        relative = MakeTransform(-0.22f, -0.24f, -0.46f, -10.0f);
+        usingHmdFallback = true;
+        g_wristDotFacingViewer = true;
+        absolute = Multiply34(hmdPose, MakeTransform(wantLeft ? -0.24f : 0.24f, -0.22f, -0.48f, -8.0f));
         return true;
     }
 
-    // Compact panel slightly above/in front of the controller. This is intentionally
-    // conservative and can be tuned after the final VR hardware test.
-    relative = MakeTransform(0.0f, 0.055f, -0.14f, -55.0f);
+    device = selected;
+    usingHmdFallback = false;
+
+    // Start exactly at the runtime's tracked grip origin, then apply the
+    // user's small controller-local calibration. Different runtimes expose
+    // noticeably different grip origins, so these offsets are intentionally
+    // configurable instead of hard-coded.
+    const float localX = g_ui.wristDotOffsetX;
+    const float localY = g_ui.wristDotOffsetY;
+    const float localZ = g_ui.wristDotOffsetZ;
+    const float px = controllerPose.m[0][3] +
+                     controllerPose.m[0][0] * localX +
+                     controllerPose.m[0][1] * localY +
+                     controllerPose.m[0][2] * localZ;
+    const float py = controllerPose.m[1][3] +
+                     controllerPose.m[1][0] * localX +
+                     controllerPose.m[1][1] * localY +
+                     controllerPose.m[1][2] * localZ;
+    const float pz = controllerPose.m[2][3] +
+                     controllerPose.m[2][0] * localX +
+                     controllerPose.m[2][1] * localY +
+                     controllerPose.m[2][2] * localZ;
+
+    // The visible quad always faces the HMD for readability, therefore
+    // NoBackside cannot express the natural wrist-launcher rule: visible when
+    // the calibrated hand surface faces the user, hidden when the hand flips
+    // away. The saved local offset doubles as that surface normal. This also
+    // adapts to users who place the dot at different points on Index/Touch/etc.
+    // Tiny/unconfigured offsets keep the legacy always-visible behavior.
+    const float offsetLen = std::sqrt(localX * localX + localY * localY + localZ * localZ);
+    if (offsetLen > 0.012f && !g_wristGripGrabActive) {
+        const float lx = localX / offsetLen;
+        const float ly = localY / offsetLen;
+        const float lz = localZ / offsetLen;
+        const float nx = controllerPose.m[0][0] * lx + controllerPose.m[0][1] * ly + controllerPose.m[0][2] * lz;
+        const float ny = controllerPose.m[1][0] * lx + controllerPose.m[1][1] * ly + controllerPose.m[1][2] * lz;
+        const float nz = controllerPose.m[2][0] * lx + controllerPose.m[2][1] * ly + controllerPose.m[2][2] * lz;
+        float vx = hmdPose.m[0][3] - px;
+        float vy = hmdPose.m[1][3] - py;
+        float vz = hmdPose.m[2][3] - pz;
+        const float vLen = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (vLen > 0.0001f) {
+            vx /= vLen; vy /= vLen; vz /= vLen;
+            // Small positive dead-zone avoids flicker when the wrist is almost
+            // exactly edge-on to the viewer.
+            g_wristDotFacingViewer = (nx * vx + ny * vy + nz * vz) > 0.05f;
+        } else {
+            g_wristDotFacingViewer = true;
+        }
+    } else {
+        // Keep the dot visible while Grip-calibrating so it cannot disappear
+        // under the user's hand halfway through a reposition gesture.
+        g_wristDotFacingViewer = true;
+    }
+
+    // Face the small launcher toward the user's HMD every frame. Controller
+    // local rotations vary noticeably between Index/Quest/Pico/WMR runtimes,
+    // which was the main reason the old relative transform could look "off hand".
+    float zx = hmdPose.m[0][3] - px;
+    float zy = hmdPose.m[1][3] - py;
+    float zz = hmdPose.m[2][3] - pz;
+    float zLen = std::sqrt(zx * zx + zy * zy + zz * zz);
+    if (zLen < 0.0001f) return false;
+    zx /= zLen; zy /= zLen; zz /= zLen;
+
+    // right = worldUp x forwardToViewer
+    float xx = zz;
+    float xy = 0.0f;
+    float xz = -zx;
+    float xLen = std::sqrt(xx * xx + xz * xz);
+    if (xLen < 0.0001f) {
+        xx = 1.0f; xy = 0.0f; xz = 0.0f;
+    } else {
+        xx /= xLen; xz /= xLen;
+    }
+
+    // up = forwardToViewer x right
+    float yx = zy * xz - zz * xy;
+    float yy = zz * xx - zx * xz;
+    float yz = zx * xy - zy * xx;
+    float yLen = std::sqrt(yx * yx + yy * yy + yz * yz);
+    if (yLen < 0.0001f) {
+        yx = 0.0f; yy = 1.0f; yz = 0.0f;
+    } else {
+        yx /= yLen; yy /= yLen; yz /= yLen;
+    }
+
+    vr::HmdMatrix34_t m{};
+    // Matrix columns are the overlay local X/Y/Z axes in Standing space.
+    m.m[0][0] = xx; m.m[0][1] = yx; m.m[0][2] = zx; m.m[0][3] = px;
+    m.m[1][0] = xy; m.m[1][1] = yy; m.m[1][2] = zy; m.m[1][3] = py;
+    m.m[2][0] = xz; m.m[2][1] = yz; m.m[2][2] = zz; m.m[2][3] = pz;
+    absolute = m;
     return true;
 }
 
 bool GetCurrentOverlayAbsolute(vr::HmdMatrix34_t& out) {
     if (g_wristStandby) {
         vr::TrackedDeviceIndex_t wristDevice = vr::k_unTrackedDeviceIndexInvalid;
-        vr::HmdMatrix34_t wristRelative{};
-        vr::HmdMatrix34_t wristAbs{};
-        if (!ResolveWristRelative(wristDevice, wristRelative) || !GetAbsoluteDevicePose(wristDevice, wristAbs)) return false;
-        out = Multiply34(wristAbs, wristRelative);
-        return true;
+        bool hmdFallback = false;
+        return ResolveWristAbsolute(wristDevice, out, hmdFallback);
     }
 
     if (g_anchor == AnchorMode::WorldFixed && g_worldTransformValid) {
@@ -1618,12 +2300,20 @@ vr::TrackedDeviceIndex_t ChooseGrabController() {
     return vr::k_unTrackedDeviceIndexInvalid;
 }
 
-bool BeginVrGrab(vr::VROverlayHandle_t overlay) {
+void MarkVrInteraction(bool forceTextureSubmit = false);
+
+bool BeginVrGrab(vr::VROverlayHandle_t overlay,
+                 GrabInputSource inputSource = GrabInputSource::TriggerHandle,
+                 vr::TrackedDeviceIndex_t preferredController = vr::k_unTrackedDeviceIndexInvalid) {
     if (g_previewMode || g_wristStandby || overlay == vr::k_ulOverlayHandleInvalid || g_vrGrabActive) return false;
     auto* ov = vr::VROverlay();
-    if (!ov) return false;
+    auto* sys = vr::VRSystem();
+    if (!ov || !sys) return false;
 
-    const vr::TrackedDeviceIndex_t controller = ChooseGrabController();
+    const bool preferredValid = preferredController != vr::k_unTrackedDeviceIndexInvalid &&
+                                preferredController < vr::k_unMaxTrackedDeviceCount &&
+                                sys->GetTrackedDeviceClass(preferredController) == vr::TrackedDeviceClass_Controller;
+    const vr::TrackedDeviceIndex_t controller = preferredValid ? preferredController : ChooseGrabController();
     if (controller == vr::k_unTrackedDeviceIndexInvalid) return false;
 
     vr::HmdMatrix34_t controllerAbs{};
@@ -1631,10 +2321,121 @@ bool BeginVrGrab(vr::VROverlayHandle_t overlay) {
     if (!GetAbsoluteDevicePose(controller, controllerAbs) || !GetCurrentOverlayAbsolute(overlayAbs)) return false;
 
     g_vrGrabDevice = controller;
+    g_lastPointerDevice = controller;
     g_vrGrabRelative = Multiply34(InverseRigid34(controllerAbs), overlayAbs);
+    g_vrGrabSmoothedAbsolute = overlayAbs;
+    g_vrGrabInputSource = inputSource;
+    g_vrGrabLastUpdate = std::chrono::steady_clock::now();
     g_vrGrabActive = true;
-    ov->SetOverlayTransformTrackedDeviceRelative(overlay, controller, &g_vrGrabRelative);
+    if (g_ui.grabPositionDamping <= 0.0001f && g_ui.grabRotationDamping <= 0.0001f) {
+        // Preserve TB02's direct compositor-tracked grab when damping is off.
+        ov->SetOverlayTransformTrackedDeviceRelative(overlay, controller, &g_vrGrabRelative);
+    } else {
+        ov->SetOverlayTransformAbsolute(overlay, vr::TrackingUniverseStanding, &g_vrGrabSmoothedAbsolute);
+    }
+    MarkVrInteraction(true);
+    PulseHaptic(0.55f);
     return true;
+}
+
+float ApplyAxisDeadzone(float value, float deadzone = 0.18f) {
+    const float magnitude = std::fabs(value);
+    if (magnitude <= deadzone) return 0.0f;
+    const float normalized = (magnitude - deadzone) / (1.0f - deadzone);
+    return std::copysign(normalized * normalized, value);
+}
+
+int FindPrimaryControllerAxis(vr::TrackedDeviceIndex_t device) {
+    static std::array<int, vr::k_unMaxTrackedDeviceCount> cached = [] {
+        std::array<int, vr::k_unMaxTrackedDeviceCount> result{};
+        result.fill(-2);
+        return result;
+    }();
+    if (device >= vr::k_unMaxTrackedDeviceCount) return -1;
+    int& cachedAxis = cached[device];
+    if (cachedAxis != -2) return cachedAxis;
+
+    cachedAxis = -1;
+    auto* sys = vr::VRSystem();
+    if (!sys) return -1;
+    int trackpadFallback = -1;
+    for (int axis = 0; axis < vr::k_unControllerStateAxisCount; ++axis) {
+        const auto property = static_cast<vr::ETrackedDeviceProperty>(
+            static_cast<int>(vr::Prop_Axis0Type_Int32) + axis);
+        const int32_t axisType = sys->GetInt32TrackedDeviceProperty(device, property);
+        if (axisType == vr::k_eControllerAxis_Joystick) {
+            cachedAxis = axis;
+            return cachedAxis;
+        }
+        if (axisType == vr::k_eControllerAxis_TrackPad && trackpadFallback < 0)
+            trackpadFallback = axis;
+    }
+    // Do not guess axis 0: on some runtimes it is a Trigger, which would turn
+    // a grab squeeze into unintended scaling. Unsupported mappings simply
+    // keep grab movement available without thumbstick manipulation.
+    cachedAxis = trackpadFallback;
+    return cachedAxis;
+}
+
+void UpdateVrGrabTransform(vr::VROverlayHandle_t overlay) {
+    if (!g_vrGrabActive || g_previewMode || overlay == vr::k_ulOverlayHandleInvalid) return;
+    auto* ov = vr::VROverlay();
+    auto* sys = vr::VRSystem();
+    if (!ov || !sys) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = std::clamp(
+        std::chrono::duration<float>(now - g_vrGrabLastUpdate).count(), 0.0f, 0.05f);
+    g_vrGrabLastUpdate = now;
+
+    bool controlsChanged = false;
+    if (g_interactionMode == InteractionMode::Layout) {
+        vr::VRControllerState_t state{};
+        if (sys->GetControllerState(g_vrGrabDevice, &state, sizeof(state))) {
+            const int axis = FindPrimaryControllerAxis(g_vrGrabDevice);
+            if (axis >= 0 && axis < vr::k_unControllerStateAxisCount) {
+                const float scaleAxis = ApplyAxisDeadzone(state.rAxis[axis].x);
+                const float distanceAxis = ApplyAxisDeadzone(state.rAxis[axis].y);
+                if (std::fabs(distanceAxis) > 0.0001f) {
+                    g_vrGrabRelative.m[2][3] = std::clamp(
+                        g_vrGrabRelative.m[2][3] - distanceAxis * g_ui.pushPullSpeed * dt,
+                        -2.50f, -0.15f);
+                    controlsChanged = true;
+                }
+                if (std::fabs(scaleAxis) > 0.0001f) {
+                    g_widthMeters = std::clamp(
+                        g_widthMeters + scaleAxis * g_ui.scaleSpeed * dt,
+                        0.80f, 2.50f);
+                    controlsChanged = true;
+                }
+            }
+        }
+    }
+
+    const bool useDamping = g_ui.grabPositionDamping > 0.0001f ||
+                            g_ui.grabRotationDamping > 0.0001f;
+    if (!useDamping) {
+        if (controlsChanged) {
+            ov->SetOverlayTransformTrackedDeviceRelative(overlay, g_vrGrabDevice, &g_vrGrabRelative);
+            ov->SetOverlayWidthInMeters(overlay, g_widthMeters);
+            MarkVrInteraction();
+        }
+        return;
+    }
+
+    vr::HmdMatrix34_t controllerAbsolute{};
+    if (!GetAbsoluteDevicePose(g_vrGrabDevice, controllerAbsolute)) return;
+    const vr::HmdMatrix34_t target = Multiply34(controllerAbsolute, g_vrGrabRelative);
+    g_vrGrabSmoothedAbsolute = BlendRigid34(
+        g_vrGrabSmoothedAbsolute,
+        target,
+        DampingBlend(g_ui.grabPositionDamping, dt),
+        DampingBlend(g_ui.grabRotationDamping, dt));
+    ov->SetOverlayTransformAbsolute(overlay, vr::TrackingUniverseStanding, &g_vrGrabSmoothedAbsolute);
+    if (controlsChanged) {
+        ov->SetOverlayWidthInMeters(overlay, g_widthMeters);
+        MarkVrInteraction();
+    }
 }
 
 void EndVrGrab(vr::VROverlayHandle_t overlay) {
@@ -1643,7 +2444,12 @@ void EndVrGrab(vr::VROverlayHandle_t overlay) {
 
     vr::HmdMatrix34_t controllerAbs{};
     if (ov && GetAbsoluteDevicePose(g_vrGrabDevice, controllerAbs)) {
-        g_worldTransform = Multiply34(controllerAbs, g_vrGrabRelative);
+        const bool useDamping = g_ui.grabPositionDamping > 0.0001f ||
+                                g_ui.grabRotationDamping > 0.0001f;
+        g_worldTransform = useDamping
+            ? g_vrGrabSmoothedAbsolute
+            : Multiply34(controllerAbs, g_vrGrabRelative);
+        if (g_ui.autoFaceOnRelease) FaceTransformTowardHmd(g_worldTransform);
         g_worldTransformValid = true;
         g_anchor = AnchorMode::WorldFixed;
         ov->SetOverlayTransformAbsolute(overlay, vr::TrackingUniverseStanding, &g_worldTransform);
@@ -1652,6 +2458,311 @@ void EndVrGrab(vr::VROverlayHandle_t overlay) {
 
     g_vrGrabActive = false;
     g_vrGrabDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_vrGrabInputSource = GrabInputSource::None;
+    MarkVrInteraction(true);
+    PulseHaptic(0.35f);
+    if (g_autoSave) SaveSettings();
+}
+
+void CancelVrGrabState() {
+    g_vrGrabActive = false;
+    g_vrGrabDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_vrGrabInputSource = GrabInputSource::None;
+    g_layoutGripWasDown.fill(false);
+    g_gripEventKnown.fill(false);
+    g_gripEventDown.fill(false);
+    g_gripTouchEventKnown.fill(false);
+    g_gripTouchEventDown.fill(false);
+    g_knucklesGripInitialized.fill(false);
+    g_knucklesGripRawTouch.fill(false);
+    g_knucklesGripStableTouch.fill(false);
+    g_knucklesGripArmed.fill(false);
+    g_knucklesGripActive.fill(false);
+    g_knucklesGripRawChanged.fill({});
+    g_wristGripGrabActive = false;
+    g_wristGripGrabDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_wristGripWasDown.fill(false);
+}
+
+bool FaceOverlayTowardHmd(vr::VROverlayHandle_t overlay) {
+    if (g_previewMode) {
+        g_vrPlacementStatus = "桌面模擬：已執行面向我";
+        return true;
+    }
+    if (g_vrGrabActive || overlay == vr::k_ulOverlayHandleInvalid) return false;
+    vr::HmdMatrix34_t current{};
+    if (!GetCurrentOverlayAbsolute(current) || !FaceTransformTowardHmd(current)) {
+        g_vrPlacementStatus = "面向我失敗：無法取得 HMD 或鍵盤位置";
+        return false;
+    }
+    auto* ov = vr::VROverlay();
+    if (!ov) return false;
+    g_worldTransform = current;
+    g_worldTransformValid = true;
+    g_anchor = AnchorMode::WorldFixed;
+    ov->SetOverlayTransformAbsolute(overlay, vr::TrackingUniverseStanding, &g_worldTransform);
+    ov->SetOverlayWidthInMeters(overlay, g_widthMeters);
+    g_vrPlacementStatus = "鍵盤已轉向並固定面向目前位置";
+    MarkVrInteraction(true);
+    return true;
+}
+
+std::string GetTrackedDeviceString(vr::TrackedDeviceIndex_t device, vr::ETrackedDeviceProperty prop) {
+    auto* sys = vr::VRSystem();
+    if (!sys) return {};
+    vr::ETrackedPropertyError err = vr::TrackedProp_Success;
+    const uint32_t needed = sys->GetStringTrackedDeviceProperty(device, prop, nullptr, 0, &err);
+    if (needed <= 1 || (err != vr::TrackedProp_Success && err != vr::TrackedProp_BufferTooSmall)) return {};
+    std::string value(needed, '\0');
+    err = vr::TrackedProp_Success;
+    sys->GetStringTrackedDeviceProperty(device, prop, value.data(), needed, &err);
+    if (err != vr::TrackedProp_Success) return {};
+    if (!value.empty() && value.back() == '\0') value.pop_back();
+    return value;
+}
+
+bool LooksLikeKnucklesController(vr::TrackedDeviceIndex_t device) {
+    std::string id = GetTrackedDeviceString(device, vr::Prop_ControllerType_String);
+    id += " ";
+    id += GetTrackedDeviceString(device, vr::Prop_ModelNumber_String);
+    id += " ";
+    id += GetTrackedDeviceString(device, vr::Prop_InputProfilePath_String);
+    std::transform(id.begin(), id.end(), id.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return id.find("knuckles") != std::string::npos ||
+           id.find("index controller") != std::string::npos ||
+           id.find("valve index") != std::string::npos;
+}
+
+bool LooksLikeTouchController(vr::TrackedDeviceIndex_t device) {
+    std::string id = GetTrackedDeviceString(device, vr::Prop_ControllerType_String);
+    id += " ";
+    id += GetTrackedDeviceString(device, vr::Prop_ModelNumber_String);
+    id += " ";
+    id += GetTrackedDeviceString(device, vr::Prop_InputProfilePath_String);
+    std::transform(id.begin(), id.end(), id.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return id.find("oculus") != std::string::npos ||
+           id.find("quest") != std::string::npos ||
+           id.find("touch") != std::string::npos ||
+           id.find("rift") != std::string::npos;
+}
+
+int FindGripAnalogAxis(vr::TrackedDeviceIndex_t device) {
+    if (device >= vr::k_unMaxTrackedDeviceCount) return -1;
+    int& cached = g_gripAnalogAxis[device];
+    if (cached >= -1) return cached;
+
+    auto* sys = vr::VRSystem();
+    if (!sys) return -1;
+
+    // Standard legacy Touch mapping advertises index trigger + hand squeeze as
+    // two Trigger-type axes. Prefer the second Trigger-type axis.
+    int triggerCount = 0;
+    for (int axis = 0; axis < vr::k_unControllerStateAxisCount; ++axis) {
+        const auto prop = static_cast<vr::ETrackedDeviceProperty>(
+            static_cast<int>(vr::Prop_Axis0Type_Int32) + axis);
+        const int32_t axisType = sys->GetInt32TrackedDeviceProperty(device, prop);
+        if (axisType != vr::k_eControllerAxis_Trigger) continue;
+        ++triggerCount;
+        if (triggerCount >= 2) {
+            cached = axis;
+            return cached;
+        }
+    }
+
+    // Some Steam Link / compatibility drivers expose the classic Oculus Touch
+    // layout but omit the AxisNType metadata. Valve's legacy Oculus layout uses
+    // axis 2 for squeeze, so keep that as a controller-identity fallback.
+    if (LooksLikeTouchController(device)) {
+        cached = 2;
+        return cached;
+    }
+
+    // Leave as unknown rather than permanently unsupported so compatible legacy scalar axes can still be discovered
+    // an untyped scalar axis while the user squeezes Grip.
+    return -1;
+}
+
+bool ReadControllerGripDown(vr::TrackedDeviceIndex_t device, bool& down) {
+    down = false;
+    auto* sys = vr::VRSystem();
+    if (!sys || device >= vr::k_unMaxTrackedDeviceCount ||
+        sys->GetTrackedDeviceClass(device) != vr::TrackedDeviceClass_Controller) return false;
+
+    vr::VRControllerState_t state{};
+    const bool haveState = sys->GetControllerState(device, &state, sizeof(state));
+    bool digitalDown = false;
+    bool analogDown = g_gripAnalogDown[device];
+    if (haveState) {
+        const uint64_t gripMask = vr::ButtonMaskFromId(vr::k_EButton_Grip);
+        digitalDown = (state.ulButtonPressed & gripMask) != 0;
+
+        int axis = FindGripAnalogAxis(device);
+        auto scalarDown = [&](int a) {
+            if (a < 0 || a >= vr::k_unControllerStateAxisCount) return false;
+            const float value = state.rAxis[a].x;
+            const float pressThreshold = g_gripAnalogDown[device] ? 0.35f : 0.60f;
+            return value >= pressThreshold;
+        };
+
+        if (axis >= 0) {
+            analogDown = scalarDown(axis);
+        } else {
+            // Last-resort legacy discovery. Only consider axes 2..4 whose type
+            // is Trigger or None and whose Y component behaves like a scalar.
+            // Joystick/trackpad axes are explicitly excluded, so moving a stick
+            // cannot accidentally grab the keyboard.
+            for (int candidate = 2; candidate < vr::k_unControllerStateAxisCount; ++candidate) {
+                const auto prop = static_cast<vr::ETrackedDeviceProperty>(
+                    static_cast<int>(vr::Prop_Axis0Type_Int32) + candidate);
+                const int32_t axisType = sys->GetInt32TrackedDeviceProperty(device, prop);
+                if (axisType == vr::k_eControllerAxis_Joystick ||
+                    axisType == vr::k_eControllerAxis_TrackPad) continue;
+                if (std::fabs(state.rAxis[candidate].y) > 0.15f) continue;
+                if (state.rAxis[candidate].x >= 0.60f) {
+                    g_gripAnalogAxis[device] = candidate;
+                    axis = candidate;
+                    analogDown = true;
+                    break;
+                }
+            }
+            if (axis < 0) analogDown = false;
+        }
+        g_gripAnalogDown[device] = analogDown;
+    }
+
+    bool knucklesTouchDown = false;
+    bool knucklesTouchEventUsable = false;
+    if (LooksLikeKnucklesController(device)) {
+        const uint64_t gripMask = vr::ButtonMaskFromId(vr::k_EButton_Grip);
+        bool rawTouch = haveState && (state.ulButtonTouched & gripMask) != 0;
+
+        // TEST13: SteamVR Dashboard can take legacy controller input focus.
+        // Preserve the validated capacitive Knuckles gesture by OR-ing the
+        // event-backed touch state while Dashboard is visible. Outside the
+        // Dashboard the direct controller state remains authoritative.
+        bool dashboardVisible = false;
+        if (auto* ov = vr::VROverlay()) dashboardVisible = ov->IsDashboardVisible();
+        knucklesTouchEventUsable = dashboardVisible && g_gripTouchEventKnown[device];
+        if (knucklesTouchEventUsable)
+            rawTouch = rawTouch || g_gripTouchEventDown[device];
+
+        const bool haveTouchSource = haveState || knucklesTouchEventUsable;
+        if (haveTouchSource) {
+            const auto now = std::chrono::steady_clock::now();
+
+            if (!g_knucklesGripInitialized[device]) {
+                g_knucklesGripInitialized[device] = true;
+                g_knucklesGripRawTouch[device] = rawTouch;
+                g_knucklesGripStableTouch[device] = rawTouch;
+                g_knucklesGripRawChanged[device] = now;
+                // Never start grabbed when the application launches while the
+                // controller is already held. Observe a genuine release first.
+                g_knucklesGripArmed[device] = !rawTouch;
+                g_knucklesGripActive[device] = false;
+            } else {
+                if (rawTouch != g_knucklesGripRawTouch[device]) {
+                    g_knucklesGripRawTouch[device] = rawTouch;
+                    g_knucklesGripRawChanged[device] = now;
+                }
+
+                // Capacitive Grip on Knuckles can chatter while fingers roll on
+                // the handle. Require a stable contact/release before changing the
+                // logical grab state.
+                const auto stableFor = now - g_knucklesGripRawChanged[device];
+                const auto required = rawTouch ? std::chrono::milliseconds(70)
+                                               : std::chrono::milliseconds(100);
+                if (stableFor >= required && rawTouch != g_knucklesGripStableTouch[device]) {
+                    g_knucklesGripStableTouch[device] = rawTouch;
+                    if (!rawTouch) {
+                        g_knucklesGripActive[device] = false;
+                        g_knucklesGripArmed[device] = true;
+                    } else if (g_knucklesGripArmed[device]) {
+                        g_knucklesGripActive[device] = true;
+                        g_knucklesGripArmed[device] = false;
+                    }
+                }
+            }
+            knucklesTouchDown = g_knucklesGripActive[device];
+        }
+    }
+
+    const bool eventDown = g_gripEventKnown[device] && g_gripEventDown[device];
+    down = digitalDown || analogDown || eventDown || knucklesTouchDown;
+    return haveState || g_gripEventKnown[device] || knucklesTouchEventUsable;
+}
+
+bool ControllerRayIntersectsOverlay(vr::VROverlayHandle_t overlay,
+                                    vr::TrackedDeviceIndex_t device) {
+    auto* ov = vr::VROverlay();
+    if (!ov || overlay == vr::k_ulOverlayHandleInvalid) return false;
+    vr::HmdMatrix34_t pose{};
+    if (!GetAbsoluteDevicePose(device, pose)) return false;
+
+    vr::VROverlayIntersectionParams_t params{};
+    params.vSource.v[0] = pose.m[0][3];
+    params.vSource.v[1] = pose.m[1][3];
+    params.vSource.v[2] = pose.m[2][3];
+    params.vDirection.v[0] = -pose.m[0][2];
+    params.vDirection.v[1] = -pose.m[1][2];
+    params.vDirection.v[2] = -pose.m[2][2];
+    params.eOrigin = vr::TrackingUniverseStanding;
+    vr::VROverlayIntersectionResults_t hit{};
+    return ov->ComputeOverlayIntersection(overlay, &params, &hit);
+}
+
+void DriveLayoutAndGrabInteraction(vr::VROverlayHandle_t overlay) {
+    if (g_previewMode || overlay == vr::k_ulOverlayHandleInvalid) return;
+    auto* sys = vr::VRSystem();
+    if (!sys) return;
+
+    // Free Grip grab is available during normal keyboard use.  Layout mode
+    // only adds thumbstick push/pull + scaling inside UpdateVrGrabTransform().
+    const bool gripModeAvailable = !g_wristStandby && g_ui.layoutGripGrabEnabled;
+    if (!gripModeAvailable) {
+        g_layoutGripWasDown.fill(false);
+        if (g_vrGrabActive && g_vrGrabInputSource == GrabInputSource::GripLayout)
+            EndVrGrab(overlay);
+        UpdateVrGrabTransform(overlay);
+        return;
+    }
+
+    bool activeGrabDeviceSeen = false;
+    for (vr::TrackedDeviceIndex_t device = 0; device < vr::k_unMaxTrackedDeviceCount; ++device) {
+        if (sys->GetTrackedDeviceClass(device) != vr::TrackedDeviceClass_Controller) {
+            g_layoutGripWasDown[device] = false;
+            continue;
+        }
+
+        bool gripDown = false;
+        if (!ReadControllerGripDown(device, gripDown)) {
+            g_layoutGripWasDown[device] = false;
+            continue;
+        }
+        const bool gripPressed = gripDown && !g_layoutGripWasDown[device];
+        const bool gripReleased = !gripDown && g_layoutGripWasDown[device];
+        g_layoutGripWasDown[device] = gripDown;
+
+        if (g_vrGrabActive && g_vrGrabInputSource == GrabInputSource::GripLayout &&
+            g_vrGrabDevice == device) {
+            activeGrabDeviceSeen = true;
+            if (gripReleased) EndVrGrab(overlay);
+            continue;
+        }
+
+        // Prefer SteamVR's own overlay pointer identity: that path already
+        // accounts for the controller-specific laser/tip pose.  Fall back to
+        // the legacy raw-ray intersection if no native hover is available.
+        const bool nativePointerHit = g_pointerVisible && g_lastPointerDevice == device;
+        if (!g_vrGrabActive && gripPressed &&
+            (nativePointerHit || ControllerRayIntersectsOverlay(overlay, device))) {
+            BeginVrGrab(overlay, GrabInputSource::GripLayout, device);
+            activeGrabDeviceSeen = g_vrGrabActive;
+        }
+    }
+
+    if (g_vrGrabActive && g_vrGrabInputSource == GrabInputSource::GripLayout && !activeGrabDeviceSeen)
+        EndVrGrab(overlay);
+    UpdateVrGrabTransform(overlay);
 }
 
 bool GetHmdFrontAbsolute(vr::HmdMatrix34_t& out) {
@@ -1685,11 +2796,17 @@ void SetFullOverlayVisualBounds(vr::VROverlayHandle_t overlay) {
     if (g_previewMode || overlay == vr::k_ulOverlayHandleInvalid) return;
     auto* ov = vr::VROverlay();
     if (!ov) return;
+    ov->SetOverlayFlag(overlay, vr::VROverlayFlags_NoBackside, true);
+    ov->SetOverlayFlag(overlay, vr::VROverlayFlags_EnableClickStabilization, false);
+    ov->SetOverlayInputMethod(overlay, vr::VROverlayInputMethod_Mouse);
+    g_wristDashboardNativeInput = false;
     vr::VRTextureBounds_t bounds{0.0f, 0.0f, 1.0f, 1.0f};
     ov->SetOverlayTextureBounds(overlay, &bounds);
     vr::HmdVector2_t mouseScale{{(float)TEX_W, (float)TEX_H}};
     ov->SetOverlayMouseScale(overlay, &mouseScale);
     ov->SetOverlayWidthInMeters(overlay, g_widthMeters);
+    ov->SetOverlayCurvature(overlay, g_ui.curvedOverlay ? g_ui.overlayCurvature : 0.0f);
+    g_forceTextureSubmit = true;
 }
 
 void SetWristDotVisualBounds(vr::VROverlayHandle_t overlay) {
@@ -1699,11 +2816,51 @@ void SetWristDotVisualBounds(vr::VROverlayHandle_t overlay) {
     // Crop the left TEX_H x TEX_H square from the wide render texture. This
     // makes the physical OpenVR overlay square while keeping a single shared
     // render target for both the full keyboard and wrist dot.
+    // The launcher is a symmetric circle, so render it from either side.
+    // This avoids controller-coordinate differences hiding the overlay on some runtimes.
+    ov->SetOverlayFlag(overlay, vr::VROverlayFlags_NoBackside, false);
+    // Click stabilization only affects SteamVR's own native mouse/laser path,
+    // which we deliberately disable below. Left off here so it does not
+    // silently mask timing issues in our own ray/near-touch path.
+    ov->SetOverlayFlag(overlay, vr::VROverlayFlags_EnableClickStabilization, false);
+    // IMPORTANT: default wrist input is None. DriveWristOverlayInteraction()
+    // owns ray/near-touch + Trigger input during normal scene use. Running the
+    // native Mouse path at the same time previously caused double-click, stuck
+    // long-press and cursor-jump races. UpdateWristDashboardInputMode() is the
+    // only exception: while SteamVR Dashboard is visible it temporarily enables
+    // Mouse and suspends the manual path, then restores None when Dashboard
+    // closes. The two owners therefore remain mutually exclusive.
+    ov->SetOverlayInputMethod(overlay, vr::VROverlayInputMethod_None);
+    g_wristDashboardNativeInput = false;
     const float uMax = (float)TEX_H / (float)TEX_W;
     vr::VRTextureBounds_t bounds{0.0f, 0.0f, uMax, 1.0f};
     ov->SetOverlayTextureBounds(overlay, &bounds);
     vr::HmdVector2_t mouseScale{{(float)TEX_H, (float)TEX_H}};
     ov->SetOverlayMouseScale(overlay, &mouseScale);
+    // The wrist launcher must stay geometrically flat; curving a tiny circular
+    // hit target makes near-touch and ray coordinates harder to predict.
+    ov->SetOverlayCurvature(overlay, 0.0f);
+    g_forceTextureSubmit = true;
+}
+
+void UpdateWristDashboardInputMode(vr::VROverlayHandle_t overlay) {
+    if (g_previewMode || !g_wristStandby || overlay == vr::k_ulOverlayHandleInvalid) return;
+    auto* ov = vr::VROverlay();
+    if (!ov) return;
+
+    // When SteamVR Dashboard is open it owns controller/system input focus.
+    // Temporarily let SteamVR translate its own controller pointer into mouse
+    // events for this overlay. Outside Dashboard, return to the TB03 validated
+    // manual ray/near-touch + Trigger path so two input sources never race.
+    const bool wantNativeMouse = ov->IsDashboardVisible() && g_wristDotFacingViewer;
+    if (wantNativeMouse == g_wristDashboardNativeInput) return;
+
+    ov->SetOverlayInputMethod(overlay, wantNativeMouse
+        ? vr::VROverlayInputMethod_Mouse
+        : vr::VROverlayInputMethod_None);
+    g_wristDashboardNativeInput = wantNativeMouse;
+    g_pointerVisible = false;
+    g_forceTextureSubmit = true;
 }
 
 void ApplyWristStandbyTransform(vr::VROverlayHandle_t overlay) {
@@ -1712,17 +2869,21 @@ void ApplyWristStandbyTransform(vr::VROverlayHandle_t overlay) {
     if (!ov) return;
 
     vr::TrackedDeviceIndex_t device = vr::k_unTrackedDeviceIndexInvalid;
-    vr::HmdMatrix34_t relative{};
-    if (!ResolveWristRelative(device, relative)) return;
-    ov->SetOverlayTransformTrackedDeviceRelative(overlay, device, &relative);
-    SetWristDotVisualBounds(overlay);
-    ov->SetOverlayWidthInMeters(overlay, g_ui.wristDotSizeMeters);
-    ov->SetOverlayAlpha(overlay, 1.0f);
+    vr::HmdMatrix34_t absolute{};
+    bool hmdFallback = false;
+    if (!ResolveWristAbsolute(device, absolute, hmdFallback)) return;
+
+    g_wristTrackedDevice = device;
+    g_wristUsingHmdFallback = hmdFallback;
+    g_wristAbsoluteTransform = absolute;
+    g_wristAbsoluteTransformValid = true;
+    ov->SetOverlayTransformAbsolute(overlay, vr::TrackingUniverseStanding, &absolute);
+    UpdateWristDashboardInputMode(overlay);
 }
 
 void EnterWristStandby(vr::VROverlayHandle_t overlay) {
     if (!g_wristStandby) SaveReturnPosition(overlay);
-    g_vrGrabActive = false;
+    CancelVrGrabState();
     g_wristStandby = true;
     g_wristPendingSingle = false;
     g_wristLongPressTriggered = false;
@@ -1730,14 +2891,27 @@ void EnterWristStandby(vr::VROverlayHandle_t overlay) {
     g_vrPlacementStatus = g_returnWorldTransformValid
         ? "手腕圓點待機中｜返回位置已保留"
         : "手腕圓點待機中";
+
+    // Static visual/input properties only need to be sent when entering
+    // standby. The per-frame path below only updates the transform.
+    if (!g_previewMode && overlay != vr::k_ulOverlayHandleInvalid) {
+        if (auto* ov = vr::VROverlay()) {
+            SetWristDotVisualBounds(overlay);
+            ov->SetOverlayWidthInMeters(overlay, g_ui.wristDotSizeMeters);
+            ov->SetOverlayAlpha(overlay, 1.0f);
+        }
+    }
     ApplyWristStandbyTransform(overlay);
 }
 
 void SummonKeyboard(vr::VROverlayHandle_t overlay, bool preserveExistingReturn = false) {
     if (!preserveExistingReturn) SaveReturnPosition(overlay);
     g_wristStandby = false;
+    g_wristTrackedDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_wristUsingHmdFallback = false;
+    g_wristAbsoluteTransformValid = false;
     g_wristPendingSingle = false;
-    g_vrGrabActive = false;
+    CancelVrGrabState();
     g_anchor = AnchorMode::WorldFixed;
     SetFullOverlayVisualBounds(overlay);
 
@@ -1768,8 +2942,11 @@ void ReturnKeyboard(vr::VROverlayHandle_t overlay) {
     }
 
     g_wristStandby = false;
+    g_wristTrackedDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_wristUsingHmdFallback = false;
+    g_wristAbsoluteTransformValid = false;
     g_wristPendingSingle = false;
-    g_vrGrabActive = false;
+    CancelVrGrabState();
     g_anchor = AnchorMode::WorldFixed;
     g_widthMeters = g_returnWidthMeters;
     SetFullOverlayVisualBounds(overlay);
@@ -1788,8 +2965,11 @@ void ReturnKeyboard(vr::VROverlayHandle_t overlay) {
 
 void ExpandWristKeyboard(vr::VROverlayHandle_t overlay) {
     g_wristStandby = false;
+    g_wristTrackedDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_wristUsingHmdFallback = false;
+    g_wristAbsoluteTransformValid = false;
     g_wristPendingSingle = false;
-    g_vrGrabActive = false;
+    CancelVrGrabState();
     g_anchor = g_ui.wristUseLeftHand ? AnchorMode::LeftHand : AnchorMode::RightHand;
     SetFullOverlayVisualBounds(overlay);
 
@@ -1945,8 +3125,40 @@ std::string ClipboardPreviewLabel(size_t index, const std::wstring& text) {
     return oss.str();
 }
 
-void MarkVrInteraction() {
+void MarkVrInteraction(bool forceTextureSubmit) {
     g_lastVrInteraction = std::chrono::steady_clock::now();
+    if (forceTextureSubmit) g_forceTextureSubmit = true;
+}
+
+bool TextureUpdateDue(std::chrono::steady_clock::time_point now) {
+    if (!g_ui.adaptiveTextureUpdates || g_forceTextureSubmit ||
+        g_lastTextureSubmit.time_since_epoch().count() == 0) return true;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool recentInteraction = now - g_lastVrInteraction < std::chrono::milliseconds(450);
+    const bool active = recentInteraction || g_pointerVisible || g_vrGrabActive ||
+                        io.MouseDown[0] || io.MouseDown[1] ||
+                        g_wristPendingSingle || g_macroRunning;
+    const float activeFps = std::clamp(g_ui.activeTextureFps, 45.0f, 144.0f);
+    const float idleFps = (std::min)(std::clamp(g_ui.idleTextureFps, 10.0f, 60.0f), activeFps);
+    const float fps = active ? activeFps : idleFps;
+    return std::chrono::duration<float>(now - g_lastTextureSubmit).count() >= 1.0f / fps;
+}
+
+void DrawInteractionPointer() {
+    if (g_previewMode || g_wristStandby || !g_ui.showInteractionPointer || !g_pointerVisible) return;
+    const ImVec2 position = ImGui::GetIO().MousePos;
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+        position.x < 0.0f || position.y < 0.0f ||
+        position.x > (float)TEX_W || position.y > (float)TEX_H) return;
+
+    const float scale = std::clamp(g_ui.pointerScale, 0.50f, 2.50f);
+    const float radius = 7.0f * scale;
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    drawList->AddCircleFilled(position, radius + 3.0f * scale, IM_COL32(8, 16, 28, 205), 32);
+    drawList->AddCircleFilled(position, radius, IM_COL32(106, 205, 255, 245), 32);
+    drawList->AddCircle(position, radius, IM_COL32(235, 250, 255, 255), 32, 1.5f * scale);
+    drawList->AddCircleFilled(position, 1.8f * scale, IM_COL32(255, 255, 255, 255), 16);
 }
 
 void UpdateAutoFade(vr::VROverlayHandle_t overlay) {
@@ -1954,9 +3166,15 @@ void UpdateAutoFade(vr::VROverlayHandle_t overlay) {
     auto* ov = vr::VROverlay();
     if (!ov) return;
     const float idle = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_lastVrInteraction).count();
-    // Keep the tiny wrist launcher visible; auto-fade only applies to the full keyboard.
-    const float target = g_wristStandby ? 1.0f
-        : ((g_ui.autoFadeEnabled && idle >= g_ui.autoFadeSeconds) ? g_ui.autoFadeAlpha : 1.0f);
+    // Wrist launcher visibility follows the physical calibrated hand surface.
+    // Switch immediately when the wrist flips; do not smooth through a nearly
+    // invisible input-catching state. Full keyboard auto-fade remains smooth.
+    if (g_wristStandby) {
+        g_overlayAlpha = g_wristDotFacingViewer ? 1.0f : 0.0f;
+        ov->SetOverlayAlpha(overlay, g_overlayAlpha);
+        return;
+    }
+    const float target = (g_ui.autoFadeEnabled && idle >= g_ui.autoFadeSeconds) ? g_ui.autoFadeAlpha : 1.0f;
     const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.10f);
     const float speed = (target > g_overlayAlpha) ? 12.0f : 5.0f;
     g_overlayAlpha += (target - g_overlayAlpha) * std::clamp(dt * speed, 0.0f, 1.0f);
@@ -1968,14 +3186,17 @@ void DrawMoveHandle(vr::VROverlayHandle_t overlay) {
     if (g_previewMode && !g_editorMode) return;
 
     const char* label = g_previewMode ? "拖曳鍵盤" : (g_vrGrabActive ? "移動中..." : "抓住移動");
+    const std::string stableLabel = std::string(label) + "###vr_move_handle";
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.26f, 0.38f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.36f, 0.54f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.48f, 0.68f, 1.0f));
-    ImGui::Button(label, ImVec2(112, 48));
+    ImGui::Button(stableLabel.c_str(), ImVec2(112, 48));
+    const bool moveHandleActivated = ImGui::IsItemActivated();
+    TrackHoverHaptic(ImGui::GetID("###vr_move_handle"), ImGui::IsItemHovered() && !moveHandleActivated);
     ImGui::PopStyleColor(3);
 
     if (g_previewMode) {
-        if (ImGui::IsItemActivated()) {
+        if (moveHandleActivated) {
             g_desktopKeyboardDragging = true;
             g_desktopDragStartMouse = ImGui::GetIO().MousePos;
             g_desktopDragStartOffsetX = g_ui.keyboardOffsetX;
@@ -1990,8 +3211,8 @@ void DrawMoveHandle(vr::VROverlayHandle_t overlay) {
             g_desktopKeyboardDragging = false;
             if (g_autoSave) SaveSettings();
         }
-    } else if (ImGui::IsItemActivated()) {
-        BeginVrGrab(overlay);
+    } else if (moveHandleActivated) {
+        BeginVrGrab(overlay, GrabInputSource::TriggerHandle);
     }
 
     if (ImGui::IsItemHovered()) {
@@ -2009,11 +3230,11 @@ void DrawTopBar(vr::VROverlayHandle_t overlay) {
         if (g_wristStandby) SetFullOverlayVisualBounds(overlay);
         g_wristStandby = false;
         g_wristPendingSingle = false;
-        g_vrGrabActive = false;
+        CancelVrGrabState();
     };
 
-    // Row 1: page + placement. Splitting the toolbar into two rows keeps V3.4
-    // readable even after adding wrist / summon controls.
+    // Row 1: day-to-day controls. Placement controls are deliberately hidden
+    // in Normal mode so ordinary typing cannot accidentally move the overlay.
     if (SelectedButton("鍵盤", g_page == PageMode::Keyboard && !g_ui.q9Mode, ImVec2(82, 44))) {
         g_page = PageMode::Keyboard;
         g_ui.q9Mode = false;
@@ -2037,20 +3258,15 @@ void DrawTopBar(vr::VROverlayHandle_t overlay) {
     const char* updateLabel = updateSnapshot.state == UpdateCheckState::Available ? "更新!" : "更新";
     if (SelectedButton(updateLabel, g_page == PageMode::Update, ImVec2(82, 44))) g_page = PageMode::Update;
     ImGui::SameLine(0, 18.0f);
-    if (SelectedButton("世界固定", !g_wristStandby && g_anchor == AnchorMode::WorldFixed, ImVec2(112,44))) {
-        cancelWrist(); g_anchor = AnchorMode::WorldFixed; apply(true);
+    if (SelectedButton("一般模式", g_interactionMode == InteractionMode::Normal, ImVec2(96,44))) {
+        if (g_vrGrabActive && g_vrGrabInputSource == GrabInputSource::GripLayout) EndVrGrab(overlay);
+        g_interactionMode = InteractionMode::Normal;
+        g_vrPlacementStatus = "一般模式：指向鍵盤按 Grip 可自由抓取";
     }
     ImGui::SameLine();
-    if (SelectedButton("固定視野", !g_wristStandby && g_anchor == AnchorMode::HeadLocked, ImVec2(108,44))) {
-        cancelWrist(); g_anchor = AnchorMode::HeadLocked; apply();
-    }
-    ImGui::SameLine();
-    if (SelectedButton("左手", !g_wristStandby && g_anchor == AnchorMode::LeftHand, ImVec2(78,44))) {
-        cancelWrist(); g_anchor = AnchorMode::LeftHand; apply();
-    }
-    ImGui::SameLine();
-    if (SelectedButton("右手", !g_wristStandby && g_anchor == AnchorMode::RightHand, ImVec2(78,44))) {
-        cancelWrist(); g_anchor = AnchorMode::RightHand; apply();
+    if (SelectedButton("版面配置", g_interactionMode == InteractionMode::Layout, ImVec2(104,44))) {
+        g_interactionMode = InteractionMode::Layout;
+        g_vrPlacementStatus = "版面配置：可抓取、推拉與縮放";
     }
     ImGui::SameLine(0, 18.0f);
     if (SelectedButton("手腕圓點", g_wristStandby, ImVec2(112,44))) EnterWristStandby(overlay);
@@ -2060,35 +3276,59 @@ void DrawTopBar(vr::VROverlayHandle_t overlay) {
     if (!g_returnWorldTransformValid) ImGui::BeginDisabled();
     if (ImGui::Button("返回原位", ImVec2(108,44))) ReturnKeyboard(overlay);
     if (!g_returnWorldTransformValid) ImGui::EndDisabled();
-
-    // Row 2: manipulation + utility.
-    if (!g_previewMode || g_editorMode) DrawMoveHandle(overlay);
-    if (!g_previewMode || g_editorMode) ImGui::SameLine();
-    if (ImGui::Button("縮小", ImVec2(78,42))) {
-        g_widthMeters = (std::max)(0.80f, g_widthMeters - 0.10f); apply();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("放大", ImVec2(78,42))) {
-        g_widthMeters = (std::min)(2.50f, g_widthMeters + 0.10f); apply();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("靠近", ImVec2(78,42))) {
-        g_distance = (std::max)(0.45f, g_distance - 0.08f); apply();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("遠離", ImVec2(78,42))) {
-        g_distance = (std::min)(1.50f, g_distance + 0.08f); apply();
-    }
     ImGui::SameLine(0, 18.0f);
     if (ImGui::Button("清除組合鍵", ImVec2(126,42))) g_mods.clear();
-    ImGui::SameLine(0, 18.0f);
-    ImGui::TextDisabled("%s", g_vrPlacementStatus.c_str());
     if (g_previewMode) {
         ImGui::SameLine(0, 18.0f);
         if (SelectedButton("編輯預覽", g_editorMode, ImVec2(108,42))) g_editorMode = !g_editorMode;
     }
-    ImGui::SameLine();
+    ImGui::SameLine(0, 18.0f);
     if (ImGui::Button("關閉", ImVec2(74,42))) g_running = false;
+
+    if (g_interactionMode == InteractionMode::Layout) {
+        // Row 2 exists only in Layout mode.
+        if (SelectedButton("世界固定", !g_wristStandby && g_anchor == AnchorMode::WorldFixed, ImVec2(112,42))) {
+            cancelWrist(); g_anchor = AnchorMode::WorldFixed; apply(true);
+        }
+        ImGui::SameLine();
+        if (SelectedButton("固定視野", !g_wristStandby && g_anchor == AnchorMode::HeadLocked, ImVec2(108,42))) {
+            cancelWrist(); g_anchor = AnchorMode::HeadLocked; apply();
+        }
+        ImGui::SameLine();
+        if (SelectedButton("左手", !g_wristStandby && g_anchor == AnchorMode::LeftHand, ImVec2(78,42))) {
+            cancelWrist(); g_anchor = AnchorMode::LeftHand; apply();
+        }
+        ImGui::SameLine();
+        if (SelectedButton("右手", !g_wristStandby && g_anchor == AnchorMode::RightHand, ImVec2(78,42))) {
+            cancelWrist(); g_anchor = AnchorMode::RightHand; apply();
+        }
+        ImGui::SameLine(0, 18.0f);
+        if (!g_previewMode || g_editorMode) DrawMoveHandle(overlay);
+        if (!g_previewMode || g_editorMode) ImGui::SameLine();
+        if (ImGui::Button("縮小", ImVec2(78,42))) {
+            g_widthMeters = (std::max)(0.80f, g_widthMeters - 0.10f); apply();
+            if (g_autoSave) SaveSettings();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("放大", ImVec2(78,42))) {
+            g_widthMeters = (std::min)(2.50f, g_widthMeters + 0.10f); apply();
+            if (g_autoSave) SaveSettings();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("靠近", ImVec2(78,42))) {
+            g_distance = (std::max)(0.45f, g_distance - 0.08f); apply();
+            if (g_autoSave) SaveSettings();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("遠離", ImVec2(78,42))) {
+            g_distance = (std::min)(1.50f, g_distance + 0.08f); apply();
+            if (g_autoSave) SaveSettings();
+        }
+        ImGui::SameLine(0, 18.0f);
+        if (ImGui::Button("面向我", ImVec2(90,42))) FaceOverlayTowardHmd(overlay);
+        ImGui::SameLine(0, 18.0f);
+        ImGui::TextDisabled("%s", g_vrPlacementStatus.c_str());
+    }
 }
 
 void DrawShortcuts() {
@@ -2173,7 +3413,7 @@ void DrawClipboardPage() {
 void DrawUpdatePage() {
     const UpdateCheckResult result = GetUpdateSnapshot();
 
-    ImGui::Text("VR Full Keyboard　目前版本：%s", VRFK_VERSION_STRING);
+    ImGui::Text("VR Full Keyboard　目前版本：%s · %s", VRFK_DISPLAY_VERSION, VRFK_TEST_BUILD_LABEL);
     ImGui::Spacing();
     ImGui::SeparatorText("GitHub 更新");
 
@@ -2290,7 +3530,7 @@ void FitKeyboardToArea(const ImVec2& area) {
 }
 
 void DrawEditorSidebar() {
-    ImGui::Text("編輯預覽 V%s", VRFK_VERSION_STRING);
+    ImGui::Text("編輯預覽 %s · %s", VRFK_DISPLAY_VERSION, VRFK_TEST_BUILD_LABEL);
     ImGui::Separator();
 
     bool changed = false;
@@ -2384,12 +3624,16 @@ void DrawEditorSidebar() {
             ImGui::SeparatorText("VR 回饋");
             changed |= ImGui::Checkbox("控制器震動", &g_ui.hapticEnabled);
             changed |= ImGui::SliderFloat("震動強度", &g_ui.hapticStrength, 0.05f, 1.0f, "%.2f");
+            changed |= ImGui::Checkbox("指到新按鍵時輕震", &g_ui.hoverHapticsEnabled);
+            changed |= ImGui::SliderFloat("懸停震動比例", &g_ui.hoverHapticScale, 0.05f, 0.50f, "%.2f");
+            changed |= ImGui::Checkbox("顯示 VR 互動游標", &g_ui.showInteractionPointer);
+            changed |= ImGui::SliderFloat("游標大小", &g_ui.pointerScale, 0.50f, 2.50f, "%.2f×");
 
             ImGui::SeparatorText("長按連發");
             changed |= ImGui::Checkbox("啟用長按連發", &g_ui.repeatEnabled);
             changed |= ImGui::SliderFloat("第一次等待", &g_ui.repeatDelay, 0.20f, 0.80f, "%.2f 秒");
             changed |= ImGui::SliderFloat("連發間隔", &g_ui.repeatRate, 0.035f, 0.20f, "%.3f 秒");
-            WrappedText("Backspace、Delete、方向鍵、PageUp / PageDown 等支援長按連發。", true);
+            WrappedText("Backspace、Delete 與方向鍵固定單次觸發，避免 VR 短按被誤判成連發；PageUp / PageDown 仍支援長按。", true);
 
             ImGui::SeparatorText("閒置淡化");
             changed |= ImGui::Checkbox("啟用自動淡化", &g_ui.autoFadeEnabled);
@@ -2464,14 +3708,35 @@ void DrawEditorSidebar() {
         if (ImGui::BeginTabItem("VR")) {
             ImGui::SeparatorText("手腕圓點 / 召喚");
             WrappedText("待機時只顯示一個小圓點：單擊展開完整鍵盤、雙擊召喚到眼前、長按返回進入待機前的世界位置。");
+            changed |= ImGui::Checkbox("啟動 VR 時先顯示手腕圓點", &g_ui.startInWristStandby);
             changed |= ImGui::Checkbox("待機使用左手腕", &g_ui.wristUseLeftHand);
-            changed |= ImGui::SliderFloat("圓點大小", &g_ui.wristDotSizeMeters, 0.05f, 0.14f, "%.3f m");
+            changed |= ImGui::SliderFloat("圓點大小", &g_ui.wristDotSizeMeters, 0.025f, 0.080f, "%.3f m");
             changed |= ImGui::SliderFloat("圓點透明度", &g_ui.wristDotAlpha, 0.30f, 1.00f, "%.2f");
+            changed |= ImGui::SliderFloat("圓形命中範圍", &g_ui.wristHitScale, 0.45f, 1.00f, "%.2f×");
+            ImGui::TextDisabled("命中範圍與可見圓點分離；圓形外的透明角落不會觸發。 ");
+            ImGui::SeparatorText("手腕圓點位置校準");
+            WrappedText("以目前控制器追蹤原點為中心微調；正負方向依控制器 Runtime 而異。可一次只調一個軸，VR 中確認位置後再繼續。");
+            changed |= ImGui::SliderFloat("位置 X", &g_ui.wristDotOffsetX, -0.15f, 0.15f, "%+.3f m");
+            changed |= ImGui::SliderFloat("位置 Y", &g_ui.wristDotOffsetY, -0.15f, 0.15f, "%+.3f m");
+            changed |= ImGui::SliderFloat("位置 Z", &g_ui.wristDotOffsetZ, -0.15f, 0.15f, "%+.3f m");
+            if (EditorCenteredButton("重設圓點大小與位置", ImVec2(-1.0f, 36.0f))) {
+                g_ui.wristDotSizeMeters = 0.045f;
+                g_ui.wristDotOffsetX = 0.0f;
+                g_ui.wristDotOffsetY = 0.0f;
+                g_ui.wristDotOffsetZ = 0.0f;
+                g_ui.wristHitScale = 0.85f;
+                changed = true;
+            }
             changed |= ImGui::SliderFloat("雙擊間隔", &g_ui.wristDoubleClickSeconds, 0.18f, 0.55f, "%.2f s");
             changed |= ImGui::SliderFloat("長按時間", &g_ui.wristLongPressSeconds, 0.40f, 1.50f, "%.2f s");
             ImGui::TextDisabled("單擊：展開｜雙擊：召喚｜長按：返回原位");
             ImGui::Text("狀態：%s", g_vrPlacementStatus.c_str());
             ImGui::TextDisabled("返回位置只保存於本次執行，不寫入 INI。");
+
+            ImGui::SeparatorText("VR 初始尺寸");
+            changed |= ImGui::SliderFloat("鍵盤實體寬度", &g_widthMeters, 0.80f, 1.60f, "%.2f m");
+            changed |= ImGui::SliderFloat("固定視野距離", &g_distance, 0.55f, 1.30f, "%.2f m");
+            ImGui::TextDisabled("新版預設：1.08 m / 0.92 m；調整後會保存到 INI。");
 
             if (g_previewMode) {
                 ImGui::SeparatorText("桌面模擬");
@@ -2482,8 +3747,29 @@ void DrawEditorSidebar() {
                 if (!g_returnWorldTransformValid) ImGui::EndDisabled();
             }
 
-            ImGui::SeparatorText("抓取與固定");
-            WrappedText("SteamVR 中用控制器指向上方「抓住移動」，按住扳機即可拖曳與旋轉；放開後會自動轉成世界固定。", true);
+            ImGui::SeparatorText("VR Grip 抓取");
+            WrappedText("一般模式即可指向鍵盤後按住 Grip 自由抓取；版面配置模式下抓取時額外支援搖桿推拉與縮放。此功能不使用 SteamVR Action Manifest。", true);
+            changed |= ImGui::Checkbox("允許 Grip 指向抓取", &g_ui.layoutGripGrabEnabled);
+            changed |= ImGui::Checkbox("放開後自動面向我", &g_ui.autoFaceOnRelease);
+            changed |= ImGui::SliderFloat("位置阻尼", &g_ui.grabPositionDamping, 0.0f, 0.95f, "%.2f");
+            changed |= ImGui::SliderFloat("旋轉阻尼", &g_ui.grabRotationDamping, 0.0f, 0.95f, "%.2f");
+            changed |= ImGui::SliderFloat("推拉速度", &g_ui.pushPullSpeed, 0.05f, 1.00f, "%.2f m/s");
+            changed |= ImGui::SliderFloat("縮放速度", &g_ui.scaleSpeed, 0.05f, 1.00f, "%.2f m/s");
+            ImGui::TextDisabled("阻尼 0＝TB02 原始一對一低延遲抓取。 ");
+            ImGui::TextDisabled("Valve Index / Knuckles：張開抓握手指後再握回即可抓取；再次張開即放開。 ");
+
+            ImGui::SeparatorText("曲面顯示");
+            changed |= ImGui::Checkbox("完整鍵盤使用曲面", &g_ui.curvedOverlay);
+            changed |= ImGui::SliderFloat("曲率", &g_ui.overlayCurvature, 0.0f, 0.45f, "%.2f");
+            ImGui::TextDisabled("只套用到完整鍵盤；手腕圓點固定保持平面。 ");
+
+            ImGui::SeparatorText("材質更新率");
+            changed |= ImGui::Checkbox("啟用自適應材質更新", &g_ui.adaptiveTextureUpdates);
+            changed |= ImGui::SliderFloat("互動更新率", &g_ui.activeTextureFps, 45.0f, 144.0f, "%.0f FPS");
+            changed |= ImGui::SliderFloat("閒置更新率", &g_ui.idleTextureFps, 10.0f, 60.0f, "%.0f FPS");
+            WrappedText("只限制 D3D 繪製與 SetOverlayTexture；姿勢、事件與輸入迴圈仍不 Sleep、不 WaitFrameSync。預設關閉以保留 TB02 基準。", true);
+
+            ImGui::SeparatorText("固定方式");
             ImGui::BulletText("世界固定：鍵盤留在房間座標");
             ImGui::BulletText("固定視野：跟隨 HMD");
             ImGui::BulletText("左手 / 右手：完整鍵盤跟隨控制器");
@@ -2524,24 +3810,34 @@ void DrawWristStandbyContent(vr::VROverlayHandle_t overlay, const ImVec2& areaSi
     // Desktop preview keeps the normal child size and centers the same dot.
     const float logicalW = g_previewMode ? areaSize.x : (float)TEX_H;
     const float logicalH = g_previewMode ? areaSize.y : (float)TEX_H;
-    ImGui::BeginChild("wrist_dot_panel", ImVec2(logicalW, logicalH), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGuiWindowFlags wristChildFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    if (!g_previewMode) wristChildFlags |= ImGuiWindowFlags_NoBackground;
+    ImGui::BeginChild("wrist_dot_panel", ImVec2(logicalW, logicalH), ImGuiChildFlags_None, wristChildFlags);
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float diameter = g_previewMode
-        ? std::clamp((std::min)(avail.x, avail.y) * 0.30f, 92.0f, 210.0f)
-        : 430.0f;
-    const ImVec2 topLeft(
-        origin.x + (avail.x - diameter) * 0.5f,
-        origin.y + (avail.y - diameter) * 0.5f);
-    ImGui::SetCursorScreenPos(topLeft);
 
-    const bool releasedClick = ImGui::InvisibleButton("##wrist_dot", ImVec2(diameter, diameter));
+    // Keep the visible launcher small, but give it a much larger invisible
+    // hit target. The physical OpenVR overlay is only a few centimetres wide,
+    // so this does not create a large VR obstruction; it simply makes the
+    // transparent area around the dot forgiving to laser/touch input.
+    const float visualDiameter = g_previewMode
+        ? std::clamp((std::min)(avail.x, avail.y) * 0.18f, 54.0f, 120.0f)
+        : 260.0f;
+    const float hitDiameter = (std::min)(avail.x, avail.y) *
+                              std::clamp(g_ui.wristHitScale, 0.45f, 1.00f);
+
+    const ImVec2 hitTopLeft(
+        origin.x + (avail.x - hitDiameter) * 0.5f,
+        origin.y + (avail.y - hitDiameter) * 0.5f);
+    ImGui::SetCursorScreenPos(hitTopLeft);
+
+    const bool releasedClick = ImGui::InvisibleButton("##wrist_dot", ImVec2(hitDiameter, hitDiameter));
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
     const bool activated = ImGui::IsItemActivated();
     const bool clicked = releasedClick && !g_wristLongPressTriggered;
+    TrackHoverHaptic(ImGui::GetID("##wrist_dot"), hovered && !activated);
     const double now = ImGui::GetTime();
 
     if (activated) {
@@ -2582,8 +3878,10 @@ void DrawWristStandbyContent(vr::VROverlayHandle_t overlay, const ImVec2& areaSi
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 center(topLeft.x + diameter * 0.5f, topLeft.y + diameter * 0.5f);
-    const float radius = diameter * 0.46f;
+    const ImVec2 center(
+        origin.x + avail.x * 0.5f,
+        origin.y + avail.y * 0.5f);
+    const float radius = visualDiameter * 0.46f;
     const float alpha = std::clamp(g_ui.wristDotAlpha, 0.30f, 1.0f);
     const ImU32 fill = ImGui::GetColorU32(ImVec4(
         hovered ? 0.18f : 0.10f,
@@ -2592,7 +3890,7 @@ void DrawWristStandbyContent(vr::VROverlayHandle_t overlay, const ImVec2& areaSi
         alpha));
     const ImU32 border = ImGui::GetColorU32(ImVec4(0.46f, 0.76f, 1.0f, (std::min)(1.0f, alpha + 0.10f)));
     dl->AddCircleFilled(center, radius, fill, 64);
-    dl->AddCircle(center, radius, border, 64, (std::max)(2.0f, diameter * 0.018f));
+    dl->AddCircle(center, radius, border, 64, (std::max)(2.0f, visualDiameter * 0.018f));
 
     // Long-press progress ring. It only appears while holding, so the standby
     // state remains a clean single circle when idle.
@@ -2601,7 +3899,7 @@ void DrawWristStandbyContent(vr::VROverlayHandle_t overlay, const ImVec2& areaSi
         const float a0 = -kPi * 0.5f;
         const float a1 = a0 + kPi * 2.0f * holdProgress;
         dl->PathArcTo(center, radius * 0.82f, a0, a1, 48);
-        dl->PathStroke(ImGui::GetColorU32(ImVec4(1.0f, 0.86f, 0.34f, 1.0f)), 0, (std::max)(4.0f, diameter * 0.026f));
+        dl->PathStroke(ImGui::GetColorU32(ImVec4(1.0f, 0.86f, 0.34f, 1.0f)), 0, (std::max)(4.0f, visualDiameter * 0.026f));
     }
 
     // Minimal center mark, deliberately not a text label/icon panel.
@@ -2684,9 +3982,14 @@ void DrawUI(vr::VROverlayHandle_t overlay) {
     const ImVec2 canvas = g_previewMode ? io.DisplaySize : ImVec2((float)TEX_W, (float)TEX_H);
     ImGui::SetNextWindowPos(ImVec2(0,0));
     ImGui::SetNextWindowSize(canvas);
-    ImGui::Begin("VRFullKeyboard", nullptr,
+    ImGuiWindowFlags mainFlags =
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    // The VR wrist launcher is drawn onto a texture cleared to alpha 0.  Do
+    // not let the normal ImGui window background refill that texture, or the
+    // cropped wrist overlay becomes an opaque square.
+    if (!g_previewMode && g_wristStandby) mainFlags |= ImGuiWindowFlags_NoBackground;
+    ImGui::Begin("VRFullKeyboard", nullptr, mainFlags);
 
     if (!g_previewMode && g_wristStandby) {
         DrawWristStandbyContent(overlay, ImGui::GetContentRegionAvail());
@@ -2700,7 +4003,6 @@ void DrawUI(vr::VROverlayHandle_t overlay) {
     }
     DrawTopBar(overlay);
     ImGui::Separator();
-
     if (g_previewMode && g_editorMode) {
         const float totalW = ImGui::GetContentRegionAvail().x;
         const float sideW = std::clamp(totalW * 0.33f, 500.0f, 570.0f);
@@ -2715,22 +4017,437 @@ void DrawUI(vr::VROverlayHandle_t overlay) {
         DrawKeyboardPreviewArea(overlay, ImGui::GetContentRegionAvail());
     }
 
+    DrawInteractionPointer();
     ImGui::End();
+}
+
+
+bool BeginWristGripGrab(vr::TrackedDeviceIndex_t grabDevice) {
+    if (!g_wristStandby || g_wristUsingHmdFallback || !g_wristAbsoluteTransformValid ||
+        g_wristTrackedDevice == vr::k_unTrackedDeviceIndexInvalid ||
+        g_wristTrackedDevice == vr::k_unTrackedDeviceIndex_Hmd ||
+        grabDevice == vr::k_unTrackedDeviceIndexInvalid || grabDevice == g_wristTrackedDevice) return false;
+
+    vr::HmdMatrix34_t grabAbsolute{};
+    if (!GetAbsoluteDevicePose(grabDevice, grabAbsolute)) return false;
+
+    // Preserve the point under the grab hand so the dot never snaps when the
+    // drag begins.  The resulting world point is converted back to wrist-local
+    // XYZ each frame, keeping the launcher attached to the wrist after release.
+    g_wristGripGrabRelative = Multiply34(InverseRigid34(grabAbsolute), g_wristAbsoluteTransform);
+    g_wristGripGrabDevice = grabDevice;
+    g_wristGripGrabActive = true;
+    g_lastPointerDevice = grabDevice;
+    g_vrPlacementStatus = "手腕圓點位置調整中...";
+    MarkVrInteraction(true);
+    PulseHaptic(0.45f);
+    return true;
+}
+
+void EndWristGripGrab() {
+    if (!g_wristGripGrabActive) return;
+    g_wristGripGrabActive = false;
+    g_wristGripGrabDevice = vr::k_unTrackedDeviceIndexInvalid;
+    g_vrPlacementStatus = "手腕圓點位置已更新";
+    if (g_autoSave) SaveSettings();
+    PulseHaptic(0.30f);
+}
+
+void UpdateWristGripGrab(vr::VROverlayHandle_t overlay) {
+    if (!g_wristGripGrabActive || !g_wristStandby ||
+        g_wristGripGrabDevice == vr::k_unTrackedDeviceIndexInvalid) return;
+
+    bool gripDown = false;
+    if (!ReadControllerGripDown(g_wristGripGrabDevice, gripDown) || !gripDown) {
+        EndWristGripGrab();
+        return;
+    }
+    g_wristGripWasDown[g_wristGripGrabDevice] = gripDown;
+
+    vr::HmdMatrix34_t grabAbsolute{};
+    vr::HmdMatrix34_t wristControllerAbsolute{};
+    if (!GetAbsoluteDevicePose(g_wristGripGrabDevice, grabAbsolute) ||
+        !GetAbsoluteDevicePose(g_wristTrackedDevice, wristControllerAbsolute)) return;
+
+    const vr::HmdMatrix34_t targetAbsolute = Multiply34(grabAbsolute, g_wristGripGrabRelative);
+    const vr::HmdMatrix34_t invWrist = InverseRigid34(wristControllerAbsolute);
+    const float wx = targetAbsolute.m[0][3];
+    const float wy = targetAbsolute.m[1][3];
+    const float wz = targetAbsolute.m[2][3];
+
+    g_ui.wristDotOffsetX = std::clamp(
+        invWrist.m[0][0] * wx + invWrist.m[0][1] * wy + invWrist.m[0][2] * wz + invWrist.m[0][3],
+        -0.15f, 0.15f);
+    g_ui.wristDotOffsetY = std::clamp(
+        invWrist.m[1][0] * wx + invWrist.m[1][1] * wy + invWrist.m[1][2] * wz + invWrist.m[1][3],
+        -0.15f, 0.15f);
+    g_ui.wristDotOffsetZ = std::clamp(
+        invWrist.m[2][0] * wx + invWrist.m[2][1] * wy + invWrist.m[2][2] * wz + invWrist.m[2][3],
+        -0.15f, 0.15f);
+
+    ApplyWristStandbyTransform(overlay);
+    MarkVrInteraction(true);
+}
+
+void DriveWristOverlayInteraction(vr::VROverlayHandle_t overlay) {
+    if (g_previewMode || !g_wristStandby || overlay == vr::k_ulOverlayHandleInvalid) return;
+    auto* sys = vr::VRSystem();
+    auto* ov = vr::VROverlay();
+    if (!sys || !ov) return;
+
+    // Outside SteamVR Dashboard this function is the sole input source for the
+    // wrist dot (input method None). While Dashboard is visible we temporarily
+    // switch to SteamVR native Mouse routing and consume those overlay events
+    // in ProcessOverlayEvents(). Manual mode has two compatible paths:
+    //   1) near-touch -> bring the opposite controller close to the wrist dot
+    //      and press Trigger. This path does not depend on controller ray axes.
+    //   2) controller ray -> ComputeOverlayIntersection
+    // (A third path relying on SteamVR's own native overlay-mouse system used
+    // to run in parallel here; it was removed because it independently wrote
+    // the same ImGui mouse state every frame and raced with the two paths
+    // below, causing spurious double-clicks and unreliable long-press.)
+    static std::array<bool, vr::k_unMaxTrackedDeviceCount> triggerWasDown{};
+    static std::array<bool, vr::k_unMaxTrackedDeviceCount> triggerDeliveredDown{};
+    static std::array<bool, vr::k_unMaxTrackedDeviceCount> triggerNeedsRelease{};
+    static std::array<int, vr::k_unMaxTrackedDeviceCount> triggerAxisIndex = [] {
+        std::array<int, vr::k_unMaxTrackedDeviceCount> values{};
+        values.fill(-2); // -2 unknown, -1 no advertised trigger axis
+        return values;
+    }();
+
+    ImGuiIO& io = ImGui::GetIO();
+    g_pointerVisible = false;
+
+    if (g_wristGripGrabActive) {
+        io.AddMouseButtonEvent(0, false);
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        UpdateWristGripGrab(overlay);
+        return;
+    }
+
+    std::array<vr::TrackedDeviceIndex_t, vr::k_unMaxTrackedDeviceCount> controllers{};
+    size_t count = 0;
+    for (vr::TrackedDeviceIndex_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+        if (sys->GetTrackedDeviceClass(i) != vr::TrackedDeviceClass_Controller) continue;
+        vr::HmdMatrix34_t pose{};
+        if (!GetAbsoluteDevicePose(i, pose)) continue;
+        controllers[count++] = i;
+    }
+
+    auto readTrigger = [&](vr::TrackedDeviceIndex_t d, bool& down) {
+        vr::VRControllerState_t state{};
+        if (!sys->GetControllerState(d, &state, sizeof(state))) return false;
+
+        const uint64_t triggerMask = vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+        const bool digitalPressed = (state.ulButtonPressed & triggerMask) != 0;
+
+        int& axisIndex = triggerAxisIndex[d];
+        if (axisIndex == -2) {
+            axisIndex = -1;
+            for (int axis = 0; axis < vr::k_unControllerStateAxisCount; ++axis) {
+                const auto prop = static_cast<vr::ETrackedDeviceProperty>(
+                    static_cast<int>(vr::Prop_Axis0Type_Int32) + axis);
+                const int32_t axisType = sys->GetInt32TrackedDeviceProperty(d, prop);
+                if (axisType == vr::k_eControllerAxis_Trigger) {
+                    axisIndex = axis;
+                    break;
+                }
+            }
+        }
+
+        // Some OpenXR->SteamVR runtimes expose Trigger only as an analog axis,
+        // not as k_EButton_SteamVR_Trigger in ulButtonPressed. Read both.
+        float analog = 0.0f;
+        if (axisIndex >= 0 && axisIndex < vr::k_unControllerStateAxisCount) {
+            analog = state.rAxis[axisIndex].x;
+        } else if (vr::k_unControllerStateAxisCount > 1) {
+            // Common legacy fallback used by Quest/Pico-style mappings.
+            analog = state.rAxis[1].x;
+        }
+
+        // Small hysteresis prevents noisy analog values from creating rapid
+        // down/up transitions around the threshold.
+        const float threshold = triggerWasDown[d] ? 0.35f : 0.55f;
+        down = digitalPressed || analog >= threshold;
+        return true;
+    };
+
+    // SteamVR Dashboard temporarily owns controller/system input focus. In
+    // that state SetOverlayInputMethod(Mouse) is the authoritative path. Keep
+    // the manual and native sources mutually exclusive so TEST11's stable
+    // single/double/long-press behavior cannot regress.
+    static bool dashboardNativeWasActive = false;
+    if (g_wristDashboardNativeInput) {
+        if (!dashboardNativeWasActive) {
+            for (vr::TrackedDeviceIndex_t d = 0; d < vr::k_unMaxTrackedDeviceCount; ++d) {
+                if (triggerDeliveredDown[d]) io.AddMouseButtonEvent(0, false);
+                triggerDeliveredDown[d] = false;
+                bool down = false;
+                if (readTrigger(d, down)) {
+                    triggerNeedsRelease[d] = down;
+                    triggerWasDown[d] = down;
+                }
+            }
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        }
+        dashboardNativeWasActive = true;
+
+        // TEST13: native Dashboard Mouse remains the sole Trigger/click owner,
+        // but Grip is allowed through as a completely separate grab-only path.
+        // This avoids the TEST11 double-input regression while restoring wrist
+        // dot relocation in SteamVR's system UI.
+        if (g_wristGripGrabActive) {
+            UpdateWristGripGrab(overlay);
+            return;
+        }
+
+        const vr::TrackedDeviceIndex_t pointerDevice = g_lastPointerDevice;
+        for (size_t i = 0; i < count; ++i) {
+            const vr::TrackedDeviceIndex_t d = controllers[i];
+            bool gripDown = false;
+            if (!ReadControllerGripDown(d, gripDown)) {
+                g_wristGripWasDown[d] = false;
+                continue;
+            }
+            const bool gripPressed = gripDown && !g_wristGripWasDown[d];
+            g_wristGripWasDown[d] = gripDown;
+
+            // Only the controller currently owning SteamVR's native pointer may
+            // start the grab, and never the wrist-attached controller itself.
+            if (d == pointerDevice && g_pointerVisible && d != g_wristTrackedDevice &&
+                gripPressed && BeginWristGripGrab(d)) {
+                // If Trigger happened to be held when Grip starts, make sure
+                // ImGui cannot carry a native Dashboard click into the drag.
+                io.AddMouseButtonEvent(0, false);
+                return;
+            }
+        }
+        return;
+    }
+
+    // If Dashboard closes while its native mouse was held, explicitly release
+    // ImGui once before returning to the manual Trigger path.
+    if (dashboardNativeWasActive) {
+        dashboardNativeWasActive = false;
+        io.AddMouseButtonEvent(0, false);
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    }
+
+    // The billboard quad itself always faces the viewer. Use the calibrated
+    // physical hand-surface normal to hide *and* disable input when the back
+    // of the hand turns away, preventing an invisible hit blocker.
+    if (!g_wristDotFacingViewer) {
+        for (vr::TrackedDeviceIndex_t d = 0; d < vr::k_unMaxTrackedDeviceCount; ++d) {
+            if (triggerDeliveredDown[d]) io.AddMouseButtonEvent(0, false);
+            triggerDeliveredDown[d] = false;
+            bool down = false;
+            if (readTrigger(d, down)) {
+                triggerNeedsRelease[d] = down;
+                triggerWasDown[d] = down;
+            }
+        }
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        return;
+    }
+
+    auto submitTrigger = [&](vr::TrackedDeviceIndex_t d) {
+        bool down = false;
+        if (!readTrigger(d, down)) return;
+        triggerWasDown[d] = down;
+        if (!down) triggerNeedsRelease[d] = false;
+        if (triggerNeedsRelease[d]) return;
+        if (down != triggerDeliveredDown[d]) {
+            io.AddMouseButtonEvent(0, down);
+            if (down) {
+                g_vrClickEventTime = std::chrono::steady_clock::now();
+                g_vrClickPending = true;
+                MarkVrInteraction(true);
+            }
+            triggerDeliveredDown[d] = down;
+        }
+    };
+
+    auto releaseIfNeeded = [&](vr::TrackedDeviceIndex_t d) {
+        bool down = false;
+        if (!readTrigger(d, down)) return;
+        if (triggerDeliveredDown[d]) io.AddMouseButtonEvent(0, false);
+        triggerDeliveredDown[d] = false;
+        triggerNeedsRelease[d] = down;
+        triggerWasDown[d] = down;
+    };
+
+    auto beginGripIfPressed = [&](vr::TrackedDeviceIndex_t d) {
+        bool gripDown = false;
+        if (!ReadControllerGripDown(d, gripDown)) return false;
+        const bool gripPressed = gripDown && !g_wristGripWasDown[d];
+        g_wristGripWasDown[d] = gripDown;
+        return gripPressed && BeginWristGripGrab(d);
+    };
+
+    auto tryNearTouch = [&](vr::TrackedDeviceIndex_t d) {
+        if (!g_wristAbsoluteTransformValid || d == g_wristTrackedDevice) return false;
+
+        vr::HmdMatrix34_t pose{};
+        if (!GetAbsoluteDevicePose(d, pose)) return false;
+
+        // Approximate the controller's physical tip slightly along its -Z
+        // forward axis. Also accept the grip origin itself; taking the nearer
+        // of the two works across controllers whose grip origin differs.
+        const float wx = g_wristAbsoluteTransform.m[0][3];
+        const float wy = g_wristAbsoluteTransform.m[1][3];
+        const float wz = g_wristAbsoluteTransform.m[2][3];
+
+        const float gx = pose.m[0][3];
+        const float gy = pose.m[1][3];
+        const float gz = pose.m[2][3];
+        const float tx = gx - pose.m[0][2] * 0.075f;
+        const float ty = gy - pose.m[1][2] * 0.075f;
+        const float tz = gz - pose.m[2][2] * 0.075f;
+
+        auto distSq = [&](float x, float y, float z) {
+            const float dx = x - wx, dy = y - wy, dz = z - wz;
+            return dx * dx + dy * dy + dz * dz;
+        };
+
+        const float nearestSq = (std::min)(distSq(gx, gy, gz), distSq(tx, ty, tz));
+        const float touchRadius = (std::max)(0.060f, g_ui.wristDotSizeMeters * 1.35f);
+        if (nearestSq > touchRadius * touchRadius) {
+            releaseIfNeeded(d);
+            return false;
+        }
+
+        // Put ImGui's pointer in the exact centre of the large invisible hit
+        // target. The visible dot remains small and transparent.
+        io.AddMousePosEvent((float)TEX_H * 0.5f, (float)TEX_H * 0.5f);
+        g_lastPointerDevice = d;
+        g_pointerVisible = true;
+        MarkVrInteraction();
+        if (beginGripIfPressed(d)) {
+            releaseIfNeeded(d);
+            return true;
+        }
+        submitTrigger(d);
+        return true;
+    };
+
+    auto tryRay = [&](vr::TrackedDeviceIndex_t d) {
+        vr::HmdMatrix34_t pose{};
+        if (!GetAbsoluteDevicePose(d, pose)) return false;
+
+        vr::VROverlayIntersectionParams_t params{};
+        params.vSource.v[0] = pose.m[0][3];
+        params.vSource.v[1] = pose.m[1][3];
+        params.vSource.v[2] = pose.m[2][3];
+        params.vDirection.v[0] = -pose.m[0][2];
+        params.vDirection.v[1] = -pose.m[1][2];
+        params.vDirection.v[2] = -pose.m[2][2];
+        params.eOrigin = vr::TrackingUniverseStanding;
+
+        vr::VROverlayIntersectionResults_t hit{};
+        if (!ov->ComputeOverlayIntersection(overlay, &params, &hit)) {
+            releaseIfNeeded(d);
+            return false;
+        }
+
+        const float u = std::clamp(hit.vUVs.v[0], 0.0f, 1.0f);
+        const float v = std::clamp(hit.vUVs.v[1], 0.0f, 1.0f);
+        const float dx = u - 0.5f;
+        const float dy = v - 0.5f;
+        const float hitRadiusUv = std::clamp(g_ui.wristHitScale, 0.45f, 1.00f) * 0.5f;
+        if (dx * dx + dy * dy > hitRadiusUv * hitRadiusUv) {
+            releaseIfNeeded(d);
+            return false;
+        }
+        io.AddMousePosEvent(u * (float)TEX_H, (1.0f - v) * (float)TEX_H);
+        g_lastPointerDevice = d;
+        g_pointerVisible = true;
+        MarkVrInteraction();
+        if (beginGripIfPressed(d)) {
+            releaseIfNeeded(d);
+            return true;
+        }
+        submitTrigger(d);
+        return true;
+    };
+
+    // Prefer the opposite hand. Near-touch is checked before ray input because
+    // it is independent of controller model-specific ray orientation.
+    for (size_t i = 0; i < count; ++i) {
+        const vr::TrackedDeviceIndex_t d = controllers[i];
+        if (d == g_wristTrackedDevice) continue;
+        if (tryNearTouch(d)) return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const vr::TrackedDeviceIndex_t d = controllers[i];
+        if (d == g_wristTrackedDevice) continue;
+        if (tryRay(d)) return;
+    }
+
+    // If nothing is pointing at / touching the launcher, allow any manual
+    // fallback state to release cleanly so ImGui never gets a stuck mouse-down.
+    for (size_t i = 0; i < count; ++i) {
+        releaseIfNeeded(controllers[i]);
+        bool gripDown = false;
+        if (ReadControllerGripDown(controllers[i], gripDown))
+            g_wristGripWasDown[controllers[i]] = gripDown;
+    }
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
 }
 
 void ProcessOverlayEvents(vr::VROverlayHandle_t overlay) {
     ImGuiIO& io = ImGui::GetIO();
     vr::VREvent_t e{};
     while (vr::VROverlay()->PollNextOverlayEvent(overlay, &e, sizeof(e))) {
+        // In normal wrist mode DriveWristOverlayInteraction() is the sole input
+        // source, so stale native mouse events must be dropped. During SteamVR
+        // Dashboard, however, UpdateWristDashboardInputMode() intentionally
+        // switches the dot to Mouse so the Dashboard-owned pointer can click it.
+        const bool isMouseEvent = e.eventType == vr::VREvent_FocusEnter ||
+                                   e.eventType == vr::VREvent_FocusLeave ||
+                                   e.eventType == vr::VREvent_MouseMove ||
+                                   e.eventType == vr::VREvent_MouseButtonDown ||
+                                   e.eventType == vr::VREvent_MouseButtonUp;
+        if (g_wristStandby && !g_wristDashboardNativeInput && isMouseEvent) continue;
+        if (g_wristGripGrabActive &&
+            (e.eventType == vr::VREvent_MouseButtonDown ||
+             e.eventType == vr::VREvent_MouseButtonUp)) continue;
+
+        // Some runtimes route controller button/touch transitions to the
+        // focused overlay while Dashboard owns system input. Mirror Grip here
+        // as well as in PollLegacySystemEvents() so either delivery route can
+        // sustain the validated Knuckles release-to-arm/touch-to-grab gesture.
+        if ((e.eventType == vr::VREvent_ButtonPress || e.eventType == vr::VREvent_ButtonUnpress ||
+             e.eventType == vr::VREvent_ButtonTouch || e.eventType == vr::VREvent_ButtonUntouch) &&
+            e.trackedDeviceIndex < vr::k_unMaxTrackedDeviceCount &&
+            e.data.controller.button == vr::k_EButton_Grip) {
+            if (e.eventType == vr::VREvent_ButtonPress || e.eventType == vr::VREvent_ButtonUnpress) {
+                g_gripEventKnown[e.trackedDeviceIndex] = true;
+                g_gripEventDown[e.trackedDeviceIndex] = e.eventType == vr::VREvent_ButtonPress;
+            } else {
+                g_gripTouchEventKnown[e.trackedDeviceIndex] = true;
+                g_gripTouchEventDown[e.trackedDeviceIndex] = e.eventType == vr::VREvent_ButtonTouch;
+            }
+        }
+
         switch (e.eventType) {
+            case vr::VREvent_FocusEnter:
+                g_pointerVisible = true;
+                MarkVrInteraction(true);
+                break;
+            case vr::VREvent_FocusLeave:
+                g_pointerVisible = false;
+                io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                break;
             case vr::VREvent_MouseMove:
                 MarkVrInteraction();
+                g_pointerVisible = true;
                 if (e.trackedDeviceIndex != vr::k_unTrackedDeviceIndexInvalid)
                     g_lastPointerDevice = e.trackedDeviceIndex;
                 io.AddMousePosEvent(e.data.mouse.x, (float)TEX_H - e.data.mouse.y);
                 break;
             case vr::VREvent_MouseButtonDown:
-                MarkVrInteraction();
+                MarkVrInteraction(true);
+                g_pointerVisible = true;
                 if (e.trackedDeviceIndex != vr::k_unTrackedDeviceIndexInvalid)
                     g_lastPointerDevice = e.trackedDeviceIndex;
                 if (e.data.mouse.button & vr::VRMouseButton_Left) {
@@ -2745,17 +4462,42 @@ void ProcessOverlayEvents(vr::VROverlayHandle_t overlay) {
                     g_lastPointerDevice = e.trackedDeviceIndex;
                 if (e.data.mouse.button & vr::VRMouseButton_Left) {
                     io.AddMouseButtonEvent(0, false);
-                    if (g_vrGrabActive) EndVrGrab(overlay);
+                    if (g_vrGrabActive && g_vrGrabInputSource == GrabInputSource::TriggerHandle)
+                        EndVrGrab(overlay);
                 }
                 if (e.data.mouse.button & vr::VRMouseButton_Right) io.AddMouseButtonEvent(1, false);
                 break;
             case vr::VREvent_ScrollDiscrete:
             case vr::VREvent_ScrollSmooth:
-                MarkVrInteraction();
+                MarkVrInteraction(true);
                 io.AddMouseWheelEvent(e.data.scroll.xdelta, e.data.scroll.ydelta);
                 break;
             default:
                 break;
+        }
+    }
+}
+
+void PollLegacySystemEvents() {
+    auto* sys = vr::VRSystem();
+    if (!sys) return;
+    vr::VREvent_t e{};
+    while (sys->PollNextEvent(&e, sizeof(e))) {
+        if (e.eventType == vr::VREvent_Quit) {
+            g_running = false;
+            continue;
+        }
+        if ((e.eventType == vr::VREvent_ButtonPress || e.eventType == vr::VREvent_ButtonUnpress ||
+             e.eventType == vr::VREvent_ButtonTouch || e.eventType == vr::VREvent_ButtonUntouch) &&
+            e.trackedDeviceIndex < vr::k_unMaxTrackedDeviceCount &&
+            e.data.controller.button == vr::k_EButton_Grip) {
+            if (e.eventType == vr::VREvent_ButtonPress || e.eventType == vr::VREvent_ButtonUnpress) {
+                g_gripEventKnown[e.trackedDeviceIndex] = true;
+                g_gripEventDown[e.trackedDeviceIndex] = e.eventType == vr::VREvent_ButtonPress;
+            } else {
+                g_gripTouchEventKnown[e.trackedDeviceIndex] = true;
+                g_gripTouchEventDown[e.trackedDeviceIndex] = e.eventType == vr::VREvent_ButtonTouch;
+            }
         }
     }
 }
@@ -3019,8 +4761,10 @@ int RunDesktopPreview(HINSTANCE instance) {
     SetupStyle();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(dx.device, dx.context);
+    EnsureControlExitEvent();
 
     while (g_running) {
+        if (ControlCenterRequestedExit()) { g_running = false; break; }
         MSG msg{};
         while (PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -3039,6 +4783,7 @@ int RunDesktopPreview(HINSTANCE instance) {
         ImGui::NewFrame();
         ProcessMacroQueue();
         DrawUI(vr::k_ulOverlayHandleInvalid);
+        FinishHoverHapticsFrame();
         ImGui::Render();
 
         const float clear[4] = {0.012f, 0.015f, 0.022f, 1.0f};
@@ -3055,6 +4800,7 @@ int RunDesktopPreview(HINSTANCE instance) {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     ShutdownPreviewD3D(dx);
+    CloseControlExitEvent();
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, instance);
     return 0;
@@ -3110,49 +4856,102 @@ int Run() {
     ov->SetOverlayFlag(overlay, vr::VROverlayFlags_EnableClickStabilization, false);
     SetFullOverlayVisualBounds(overlay);
     ApplyAnchor(overlay, g_anchor == AnchorMode::WorldFixed);
+    if (g_ui.startInWristStandby) EnterWristStandby(overlay);
     g_lastVrInteraction = std::chrono::steady_clock::now();
     g_overlayAlpha = 1.0f;
     ov->ShowOverlay(overlay);
 
     vr::Texture_t vrTexture{dx.texture, vr::TextureType_DirectX, vr::ColorSpace_Auto};
     auto last = std::chrono::steady_clock::now();
+    vr::EVROverlayError lastSubmitError = vr::VROverlayError_None;
+    EnsureControlExitEvent();
 
     while (g_running && vr::VRSystem()) {
-        // World-fixed overlays intentionally do not follow the HMD. Their absolute
-        // Standing-space transform is captured once when World fixed is selected.
-        if (g_anchor == AnchorMode::HeadLocked && !g_vrGrabActive) ApplyAnchor(overlay);
+        using PerfClock = std::chrono::steady_clock;
+        PerfFrameSample perf{};
+        const auto perfLoopStart = PerfClock::now();
 
-        ProcessOverlayEvents(overlay);
-        UpdateClipboardHistory();
-
-        vr::VREvent_t sysEvent{};
-        while (vr::VRSystem()->PollNextEvent(&sysEvent, sizeof(sysEvent))) {
-            if (sysEvent.eventType == vr::VREvent_Quit) {
-                g_running = false;
-                break;
-            }
+        if (ControlCenterRequestedExit()) {
+            g_running = false;
+            break;
         }
+
+        // Consume legacy button events before evaluating Grip edges so a
+        // press can start a grab in the same loop rather than after tracking.
+        const auto systemEventsStart = PerfClock::now();
+        PollLegacySystemEvents();
+        const auto systemEventsEnd = PerfClock::now();
+        if (!g_running) break;
+
+        const auto trackingStart = systemEventsEnd;
+        // Preserve the V3.9.9-style immediate tracking path. No pose cache and
+        // no artificial frame pacing is introduced by the interaction path.
+        if (g_wristStandby && !g_vrGrabActive) ApplyWristStandbyTransform(overlay);
+        else if (g_anchor == AnchorMode::HeadLocked && !g_vrGrabActive) ApplyAnchor(overlay);
+        DriveWristOverlayInteraction(overlay);
+        DriveLayoutAndGrabInteraction(overlay);
+        const auto trackingEnd = PerfClock::now();
+        perf.trackingMs = std::chrono::duration<float, std::milli>(trackingEnd - trackingStart).count();
+
+        // Keep the exact low-latency baseline call order while timing each group.
+        const auto overlayEventsStart = trackingEnd;
+        ProcessOverlayEvents(overlay);
+        const auto overlayEventsEnd = PerfClock::now();
+
+        const auto logicStart = overlayEventsEnd;
+        UpdateClipboardHistory();
+        const auto logicEnd = PerfClock::now();
+        perf.logicMs = std::chrono::duration<float, std::milli>(logicEnd - logicStart).count();
+
+        perf.eventsMs =
+            std::chrono::duration<float, std::milli>(overlayEventsEnd - overlayEventsStart).count() +
+            std::chrono::duration<float, std::milli>(systemEventsEnd - systemEventsStart).count();
 
         const auto now = std::chrono::steady_clock::now();
         io.DeltaTime = (std::max)(0.001f, std::chrono::duration<float>(now - last).count());
         last = now;
         io.DisplaySize = ImVec2((float)TEX_W, (float)TEX_H);
 
+        const auto imguiStart = PerfClock::now();
         ImGui_ImplDX11_NewFrame();
         ImGui::NewFrame();
         ProcessMacroQueue();
         DrawUI(overlay);
         UpdateAutoFade(overlay);
+        FinishHoverHapticsFrame();
         ImGui::Render();
+        const auto imguiEnd = PerfClock::now();
+        perf.imguiMs = std::chrono::duration<float, std::milli>(imguiEnd - imguiStart).count();
 
         const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        dx.context->OMSetRenderTargets(1, &dx.rtv, nullptr);
-        dx.context->ClearRenderTargetView(dx.rtv, clear);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        ov->SetOverlayTexture(overlay, &vrTexture);
-        // No forced Flush/Sleep here: both can add avoidable input-to-display latency.
+        const auto d3dStart = PerfClock::now();
+        const bool submitTexture = TextureUpdateDue(d3dStart);
+        if (submitTexture) {
+            dx.context->OMSetRenderTargets(1, &dx.rtv, nullptr);
+            dx.context->ClearRenderTargetView(dx.rtv, clear);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        }
+        const auto d3dEnd = PerfClock::now();
+        perf.d3dMs = std::chrono::duration<float, std::milli>(d3dEnd - d3dStart).count();
+
+        const auto submitStart = PerfClock::now();
+        if (submitTexture) {
+            lastSubmitError = ov->SetOverlayTexture(overlay, &vrTexture);
+            g_lastTextureSubmit = std::chrono::steady_clock::now();
+            g_forceTextureSubmit = false;
+        }
+        const auto submitEnd = PerfClock::now();
+        perf.submitMs = std::chrono::duration<float, std::milli>(submitEnd - submitStart).count();
+
+        const auto perfLoopEnd = PerfClock::now();
+        perf.totalMs = std::chrono::duration<float, std::milli>(perfLoopEnd - perfLoopStart).count();
+        PushPerfSample(perf);
+        UpdatePerfSummary(lastSubmitError);
+
+        // Latency baseline: intentionally no Sleep/WaitFrameSync/FPS cap here.
         std::this_thread::yield();
     }
+    CloseControlExitEvent();
 
     SaveSettings();
     ShutdownUpdateChecker();
@@ -3169,7 +4968,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR cmdLine, int) {
     const std::wstring args = cmdLine ? cmdLine : L"";
     const bool editorRequested = args.find(L"--editor") != std::wstring::npos || args.find(L"/editor") != std::wstring::npos;
     const bool updateRequested = args.find(L"--update") != std::wstring::npos || args.find(L"/update") != std::wstring::npos;
-    if (editorRequested) g_editorMode = true;
+    if (editorRequested) {
+        g_editorMode = true;
+        g_interactionMode = InteractionMode::Layout;
+    }
     if (updateRequested) g_page = PageMode::Update;
     if (args.find(L"--preview") != std::wstring::npos || args.find(L"/preview") != std::wstring::npos || editorRequested || updateRequested) {
         return RunDesktopPreview(hInstance);

@@ -1,0 +1,85 @@
+VRFullKeyboard - Overlay Interaction Integration
+================================================
+
+Integration status (2026-08-25)
+--------------------------------
+The source tree is identified as Alpha V3.9.10 Test Build 03. SemVer remains
+3.9.10. The Test Build 02 wrist-input arbitration and V3.9.9-style immediate
+pose/input loop are retained. Windows/MSVC compilation and SteamVR hands-on
+regression are still required.
+
+Implemented in this package
+---------------------------
+
+1. Safe layout mode
+   - Normal mode hides placement controls.
+   - Layout mode exposes anchors, grab, scale, distance and Face Me controls.
+   - Grip can grab the overlay only while pointing at it in Layout mode.
+   - Trigger-handle and Grip grabs have separate release ownership.
+
+2. Grab manipulation
+   - Thumbstick up/down changes controller-relative distance.
+   - Thumbstick left/right scales physical overlay width.
+   - Position and rotation damping are independent settings.
+   - Both damping values default to zero, preserving the direct TB02 path.
+   - Optional auto-face on release converts the result to world-fixed space.
+
+3. Pointer and haptics
+   - Configurable rendered VR pointer for the expanded keyboard.
+   - Configurable light haptic pulse when entering a new key/control.
+   - Existing click haptics remain independent.
+
+4. Wrist launcher hit testing
+   - Visible dot and logical hit area are independent.
+   - Ray hits are rejected outside the configurable circular mask.
+   - Leaving the mask explicitly releases the delivered ImGui mouse button.
+   - Wrist mode still has one input owner: DriveWristOverlayInteraction().
+
+5. Overlay presentation
+   - Expanded keyboard can use OpenVR compositor curvature.
+   - Wrist launcher always resets curvature to zero and remains flat.
+
+6. Keyboard mapping
+   - Navigation keys now carry KEYEVENTF_EXTENDEDKEY where Windows requires it.
+   - NumPad Enter explicitly carries the extended bit while main Enter does not.
+   - NumPad digits remain real VK_NUMPAD keys for Q9/IME compatibility.
+
+7. Optional texture scheduler
+   - Active and idle texture rates are configurable.
+   - Only D3D draw and SetOverlayTexture are scheduled.
+   - Pose reads, input, events, ImGui logic and grab transforms remain uncapped.
+   - No Sleep, WaitFrameSync or pose cache was introduced.
+   - The scheduler is disabled by default to preserve the TB02 baseline.
+
+8. Test-build cache identity
+   - TEST_BUILD is now a separate source of truth from VERSION.
+   - CMake generates the visible Test Build label from that file.
+   - The Control Center bootstrap cache key includes both values, preventing a
+     stale prebuilt front end when SemVer intentionally remains 3.9.10.
+
+Files intentionally updated
+---------------------------
+- src/main.cpp
+- CMakeLists.txt / VERSION / TEST_BUILD / launcher cache identity
+- cmake/VRFullKeyboardVersion.h.in
+- README.md / CHANGELOG.md / CHANGES.txt
+- TEST_BUILD_INFO.txt / REGRESSION_TEST.txt
+- ProjectHub current-state, architecture, performance and handoff documents
+
+Validation boundary
+-------------------
+Static source checks and archive integrity can run in this workspace. A real
+Windows build requires MSVC, Windows SDK, CMake and fetched OpenVR/ImGui. Final
+behavioral validation requires SteamVR plus tracked controllers.
+
+
+TB03 TEST12 focused patch (2026-08-26)
+--------------------------------------
+- Restored calibrated hand-surface visibility: wrist dot hides when the back of
+  the hand turns away and remains visible while Grip-repositioning.
+- Hidden wrist dot is non-interactive, preventing transparent input blocking.
+- Added Dashboard-aware wrist input arbitration using IVROverlay::IsDashboardVisible().
+- Normal scene use retains the KnucklesGrip_VALIDATED manual input path.
+- SteamVR Dashboard temporarily uses native overlay Mouse events so the wrist
+  dot can still be clicked while the system UI owns controller input focus.
+- No SteamVR Action Manifest or binding JSON was reintroduced.

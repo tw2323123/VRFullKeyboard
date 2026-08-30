@@ -17,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <map>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,7 @@ constexpr UINT WM_APP_UPDATE_CHECK_DONE = WM_APP + 3;
 constexpr UINT WM_APP_UPDATE_EXIT = WM_APP + 4;
 constexpr UINT WM_APP_UPDATE_PROGRESS = WM_APP + 5;
 constexpr UINT_PTR TIMER_BACKGROUND_UPDATE = 1;
+constexpr UINT_PTR TIMER_PERF_REFRESH = 2;
 
 constexpr int IDC_STATUS = 1001;
 constexpr int IDC_ENV = 1002;
@@ -45,6 +47,7 @@ constexpr int IDC_RUN_VR = 1101;
 constexpr int IDC_PREVIEW = 1102;
 constexpr int IDC_EDITOR = 1103;
 constexpr int IDC_UPDATE = 1104;
+constexpr int IDC_STOP_VR = 1105;
 constexpr int IDC_BUILD = 1201;
 constexpr int IDC_PACKAGE = 1202;
 constexpr int IDC_CLEAN = 1203;
@@ -54,6 +57,7 @@ constexpr int IDC_OPEN_ROOT = 1301;
 constexpr int IDC_SHORTCUT = 1302;
 constexpr int IDC_OPEN_LOG = 1303;
 constexpr int IDC_ROLLBACK_TEST = 1304;
+constexpr int IDC_OPEN_PERF_REPORT = 1305;
 constexpr int IDC_LOG = 1401;
 constexpr int IDC_LOG_TOGGLE = 1402;
 constexpr int IDC_LOG_CLEAR = 1403;
@@ -108,12 +112,29 @@ bool g_logExpanded = false;
 bool g_updateAvailableHint = false;
 std::wstring g_updateAvailableTag;
 std::wstring g_updateButtonSubtitle = L"檢查 GitHub、驗證並安裝新版";
+constexpr wchar_t kControlExitEventName[] = L"Local\\VRFullKeyboard.Exit.AlphaV3_9_10";
+bool g_coreRunning = false;
+struct PerfSnapshot {
+    bool valid = false;
+    float cpuPercent = 0.0f;
+    float loopsPerSec = 0.0f;
+    float avgTrackingMs = 0.0f, maxTrackingMs = 0.0f;
+    float avgEventsMs = 0.0f, maxEventsMs = 0.0f;
+    float avgLogicMs = 0.0f, maxLogicMs = 0.0f;
+    float avgImGuiMs = 0.0f, maxImGuiMs = 0.0f;
+    float avgD3DMs = 0.0f, maxD3DMs = 0.0f;
+    float avgSubmitMs = 0.0f, maxSubmitMs = 0.0f;
+    float avgTotalMs = 0.0f, maxTotalMs = 0.0f;
+    int submitError = 0;
+};
+PerfSnapshot g_perfSnapshot{};
 std::vector<HWND> g_taskButtons;
 std::vector<HWND> g_allButtons;
 std::unordered_set<HWND> g_hoverButtons;
 
 void SetLogExpanded(bool expanded);
 void Layout(HWND hwnd);
+void OpenFolder(const fs::path& path);
 void StartPublishTask(const std::wstring& version);
 void ShowReleaseDialog();
 
@@ -322,6 +343,101 @@ void AppendLog(const std::wstring& text) {
     SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
 }
 
+fs::path PerfReportPath() {
+    const std::wstring local = EnvValue(L"LOCALAPPDATA");
+    fs::path base = local.empty() ? g_root : fs::path(local);
+    return base / L"VRFullKeyboard" / L"logs" / L"perf_alpha_v3_9_10.csv";
+}
+
+fs::path PerfLivePath() {
+    const std::wstring local = EnvValue(L"LOCALAPPDATA");
+    fs::path base = local.empty() ? g_root : fs::path(local);
+    return base / L"VRFullKeyboard" / L"logs" / L"perf_live_alpha_v3_9_10.ini";
+}
+
+bool IsCoreRunning() {
+    HANDLE eventHandle = OpenEventW(SYNCHRONIZE, FALSE, kControlExitEventName);
+    if (!eventHandle) return false;
+    CloseHandle(eventHandle);
+    return true;
+}
+
+bool RequestCoreShutdown() {
+    HANDLE eventHandle = OpenEventW(EVENT_MODIFY_STATE, FALSE, kControlExitEventName);
+    if (!eventHandle) return false;
+    const BOOL ok = SetEvent(eventHandle);
+    CloseHandle(eventHandle);
+    return ok == TRUE;
+}
+
+float ParseFloatOr(const std::map<std::wstring, std::wstring>& values, const wchar_t* key, float fallback = 0.0f) {
+    auto it = values.find(key);
+    if (it == values.end()) return fallback;
+    try { return std::stof(it->second); } catch (...) { return fallback; }
+}
+
+int ParseIntOr(const std::map<std::wstring, std::wstring>& values, const wchar_t* key, int fallback = 0) {
+    auto it = values.find(key);
+    if (it == values.end()) return fallback;
+    try { return std::stoi(it->second); } catch (...) { return fallback; }
+}
+
+void RefreshPerfSnapshot() {
+    const bool wasRunning = g_coreRunning;
+    g_coreRunning = IsCoreRunning();
+    PerfSnapshot next{};
+    if (g_coreRunning) {
+        std::wifstream in(PerfLivePath());
+        std::map<std::wstring, std::wstring> values;
+        std::wstring line;
+        while (std::getline(in, line)) {
+            const size_t eq = line.find(L'=');
+            if (eq == std::wstring::npos) continue;
+            values[TrimWide(line.substr(0, eq))] = TrimWide(line.substr(eq + 1));
+        }
+        if (!values.empty()) {
+            next.valid = true;
+            next.cpuPercent = ParseFloatOr(values, L"cpu_percent");
+            next.loopsPerSec = ParseFloatOr(values, L"loops_per_sec");
+            next.avgTrackingMs = ParseFloatOr(values, L"avg_tracking_ms");
+            next.maxTrackingMs = ParseFloatOr(values, L"max_tracking_ms");
+            next.avgEventsMs = ParseFloatOr(values, L"avg_events_ms");
+            next.maxEventsMs = ParseFloatOr(values, L"max_events_ms");
+            next.avgLogicMs = ParseFloatOr(values, L"avg_logic_ms");
+            next.maxLogicMs = ParseFloatOr(values, L"max_logic_ms");
+            next.avgImGuiMs = ParseFloatOr(values, L"avg_imgui_ms");
+            next.maxImGuiMs = ParseFloatOr(values, L"max_imgui_ms");
+            next.avgD3DMs = ParseFloatOr(values, L"avg_d3d_ms");
+            next.maxD3DMs = ParseFloatOr(values, L"max_d3d_ms");
+            next.avgSubmitMs = ParseFloatOr(values, L"avg_submit_ms");
+            next.maxSubmitMs = ParseFloatOr(values, L"max_submit_ms");
+            next.avgTotalMs = ParseFloatOr(values, L"avg_total_ms");
+            next.maxTotalMs = ParseFloatOr(values, L"max_total_ms");
+            next.submitError = ParseIntOr(values, L"submit_error");
+        }
+    }
+    g_perfSnapshot = next;
+    if (g_hwnd) {
+        if (HWND stop = GetDlgItem(g_hwnd, IDC_STOP_VR)) InvalidateRect(stop, nullptr, TRUE);
+        if (wasRunning != g_coreRunning) InvalidateRect(g_hwnd, nullptr, FALSE);
+        else InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+}
+
+void OpenPerfReport() {
+    const fs::path report = PerfReportPath();
+    if (fs::exists(report)) {
+        std::wstring arg = L"/select," + Quote(report.wstring());
+        ShellExecuteW(g_hwnd, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    const fs::path dir = report.parent_path();
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    OpenFolder(dir);
+    MessageBoxW(g_hwnd, L"目前還沒有效能報告。啟動 VR 鍵盤約 1 秒後就會開始產生 CSV。", L"效能報告", MB_ICONINFORMATION);
+}
+
 void SetBusy(bool busy) {
     g_busy = busy;
     for (HWND button : g_taskButtons) {
@@ -340,6 +456,7 @@ void RefreshStatus() {
     g_coreReady = fs::exists(CoreExePath()) && fs::exists(OpenVrDllPath());
     g_cmakeReady = !FindCMake().empty();
     g_gitReady = !FindGit().empty();
+    RefreshPerfSnapshot();
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -391,6 +508,43 @@ int RunProcessCapture(const fs::path& exe, const std::vector<std::wstring>& args
     CloseHandle(pi.hProcess);
     CloseHandle(readPipe);
     return (int)exitCode;
+}
+
+bool BootstrapGitRepository(const fs::path& git, std::wstring* error = nullptr) {
+    if (fs::exists(g_root / L".git")) return true;
+
+    auto fail = [&](const std::wstring& message) {
+        if (error) *error = message;
+        PostLog(L"[Git 修復失敗] " + message + L"\r\n");
+        return false;
+    };
+    auto run = [&](const std::vector<std::wstring>& args, std::wstring* output = nullptr, bool echo = true) {
+        if (output) output->clear();
+        return RunProcessCapture(git, args, g_root, output, echo);
+    };
+
+    const std::wstring remote = L"https://github.com/" + Utf8ToWide(VRFK_GITHUB_OWNER) +
+                                L"/" + Utf8ToWide(VRFK_GITHUB_REPO) + L".git";
+    PostLog(L"[Git 修復] 找不到 .git，開始重建 Repository metadata。\r\n");
+    PostLog(L"[Git 修復] 不會覆蓋目前 Source；只重建 Git metadata 並對齊 origin/main。\r\n");
+
+    if (run({L"init"}) != 0) return fail(L"git init 失敗。");
+    if (run({L"remote", L"add", L"origin", remote}) != 0) {
+        std::wstring currentRemote;
+        if (run({L"remote", L"get-url", L"origin"}, &currentRemote, false) != 0) return fail(L"無法建立 origin remote。");
+        currentRemote = TrimWide(currentRemote);
+        if (_wcsicmp(currentRemote.c_str(), remote.c_str()) != 0 &&
+            run({L"remote", L"set-url", L"origin", remote}) != 0) return fail(L"無法修正 origin remote URL。");
+    }
+
+    if (run({L"fetch", L"origin", L"main", L"--tags"}) != 0) return fail(L"無法從 GitHub 取得 origin/main。請確認網路與 GitHub 權限。");
+    if (run({L"update-ref", L"refs/heads/main", L"refs/remotes/origin/main"}) != 0) return fail(L"無法建立本機 main 分支。");
+    if (run({L"symbolic-ref", L"HEAD", L"refs/heads/main"}) != 0) return fail(L"無法將 HEAD 指向 main。");
+    if (run({L"reset", L"--mixed", L"HEAD"}) != 0) return fail(L"無法將 Git index 對齊 origin/main。");
+    run({L"branch", L"--set-upstream-to=origin/main", L"main"}, nullptr, false);
+
+    PostLog(L"[Git 修復完成] Repository metadata 已重建；目前 Source 完整保留。\r\n");
+    return true;
 }
 
 std::wstring NormalizePathForCompare(const fs::path& path) {
@@ -1145,9 +1299,12 @@ void StartPublishTask(const std::wstring& version) {
             return;
         }
         if (!fs::exists(g_root / L".git")) {
-            done.summary = L"找不到 .git，目前資料夾不是可發布的 Git Repository。";
-            if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(new TaskDone(done)));
-            return;
+            std::wstring repairError;
+            if (!BootstrapGitRepository(git, &repairError)) {
+                done.summary = L"Git Repository metadata 自動修復失敗。\n\n" + repairError;
+                if (IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(new TaskDone(done)));
+                return;
+            }
         }
 
         auto runGit = [&](const std::vector<std::wstring>& args, std::wstring* output = nullptr, bool echo = true) -> int {
@@ -1411,6 +1568,7 @@ void RecreateFonts(HWND hwnd) {
 ButtonVisual GetButtonVisual(int id) {
     switch (id) {
     case IDC_RUN_VR: return {L"啟動 VR 鍵盤", L"連接 SteamVR 並開啟鍵盤 Overlay", ButtonTone::Primary};
+    case IDC_STOP_VR: return {L"關閉鍵盤", g_coreRunning ? L"立即結束目前測試中的鍵盤" : L"目前沒有執行中的鍵盤", ButtonTone::Danger};
     case IDC_PREVIEW: return {L"桌面預覽", L"不戴頭顯也能檢查鍵盤畫面", ButtonTone::Secondary};
     case IDC_EDITOR: return {L"編輯預覽", L"調整外觀、位置、快捷鍵與九方模式", ButtonTone::Secondary};
     case IDC_UPDATE: return {L"更新與版本", g_updateButtonSubtitle.c_str(), g_updateAvailableHint ? ButtonTone::Primary : ButtonTone::Accent};
@@ -1422,6 +1580,7 @@ ButtonVisual GetButtonVisual(int id) {
     case IDC_OPEN_ROOT: return {g_developerMode ? L"專案資料夾" : L"程式資料夾", L"在檔案總管開啟目前資料夾", ButtonTone::Utility};
     case IDC_OPEN_LOG: return {L"完整建置記錄", L"使用記事本查看完整 Log", ButtonTone::Utility};
     case IDC_ROLLBACK_TEST: return {L"測試更新回復", L"在隔離暫存區驗證備份與 Rollback", ButtonTone::Utility};
+    case IDC_OPEN_PERF_REPORT: return {L"效能報告 CSV", L"開啟可直接回傳分析的效能記錄", ButtonTone::Utility};
     case IDC_SHORTCUT: return {L"建立桌面捷徑", L"從桌面直接開啟控制中心", ButtonTone::Utility};
     case IDC_LOG_TOGGLE: return {g_logExpanded ? L"收合記錄" : L"展開記錄", L"", ButtonTone::Utility};
     case IDC_LOG_CLEAR: return {L"清空畫面", L"", ButtonTone::Utility};
@@ -1585,7 +1744,7 @@ LRESULT CALLBACK ReleaseDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             GetDlgItemTextW(hwnd, IDC_RELEASE_VERSION, buffer, static_cast<int>(std::size(buffer)));
             const std::wstring version = TrimWide(buffer);
             if (!IsSemVer(version)) {
-                MessageBoxW(hwnd, L"版本格式必須是 MAJOR.MINOR.PATCH，例如 3.9.6。",
+                MessageBoxW(hwnd, L"版本格式必須是 MAJOR.MINOR.PATCH，例如 3.9.8。",
                             L"版本格式不正確", MB_ICONWARNING | MB_OK);
                 return 0;
             }
@@ -1647,9 +1806,25 @@ void ShowReleaseDialog() {
         return;
     }
     if (!fs::exists(g_root / L".git")) {
-        MessageBoxW(g_hwnd, L"目前資料夾不是 Git Repository，找不到 .git。",
-                    L"無法發布", MB_ICONWARNING | MB_OK);
-        return;
+        const int answer = MessageBoxW(
+            g_hwnd,
+            L"目前專案資料夾缺少 .git。這通常發生在從 ZIP 接手開發版後。\n\n"
+            L"是否現在自動從官方 GitHub Repository 重建 Git metadata？\n\n"
+            L"此操作不會覆蓋目前 Source；TEST13 的本機修改會保留為待提交差異。",
+            L"修復 Git Repository",
+            MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON1);
+        if (answer != IDYES) return;
+
+        const fs::path git = FindGit();
+        std::wstring repairError;
+        if (!BootstrapGitRepository(git, &repairError)) {
+            MessageBoxW(g_hwnd, (L"無法重建 Git Repository。\n\n" + repairError).c_str(),
+                        L"Git 修復失敗", MB_ICONERROR | MB_OK);
+            return;
+        }
+        MessageBoxW(g_hwnd,
+                    L"Git Repository metadata 已重建完成。\n\n現在可以繼續發布；目前 Source 沒有被覆蓋。",
+                    L"Git 修復完成", MB_ICONINFORMATION | MB_OK);
     }
     if (g_releaseDialog && IsWindow(g_releaseDialog)) {
         SetForegroundWindow(g_releaseDialog);
@@ -1783,10 +1958,12 @@ void DrawOwnerButton(const DRAWITEMSTRUCT* dis) {
 struct LayoutMetrics {
     RECT header{};
     RECT launchCard{};
+    RECT perfCard{};
     RECT devCard{};
     RECT toolsCard{};
     RECT logCard{};
     int launchLabelY = 0;
+    int perfLabelY = 0;
     int devLabelY = 0;
     int toolsLabelY = 0;
     int logLabelY = 0;
@@ -1812,6 +1989,11 @@ LayoutMetrics ComputeLayout(HWND hwnd) {
     y += sectionTitleH;
     lm.launchCard = RECT{m, y, w - m, y + mainButtonH + cardPad * 2};
     y = lm.launchCard.bottom + ScaleForDpi(16, dpi);
+
+    lm.perfLabelY = y;
+    y += sectionTitleH;
+    lm.perfCard = RECT{m, y, w - m, y + ScaleForDpi(104, dpi)};
+    y = lm.perfCard.bottom + ScaleForDpi(16, dpi);
 
     if (g_developerMode) {
         lm.devLabelY = y;
@@ -1859,10 +2041,10 @@ void Layout(HWND hwnd) {
         }
     };
 
-    placeRow(lm.launchCard, {IDC_RUN_VR, IDC_PREVIEW, IDC_EDITOR, IDC_UPDATE}, ScaleForDpi(70, dpi));
+    placeRow(lm.launchCard, {IDC_RUN_VR, IDC_STOP_VR, IDC_PREVIEW, IDC_EDITOR, IDC_UPDATE}, ScaleForDpi(70, dpi));
     if (g_developerMode) {
         placeRow(lm.devCard, {IDC_BUILD, IDC_PACKAGE, IDC_PUBLISH_GITHUB, IDC_CLEAN, IDC_OPEN_OUTPUT}, ScaleForDpi(58, dpi));
-        placeRow(lm.toolsCard, {IDC_OPEN_ROOT, IDC_OPEN_LOG, IDC_ROLLBACK_TEST, IDC_SHORTCUT}, ScaleForDpi(50, dpi));
+        placeRow(lm.toolsCard, {IDC_OPEN_ROOT, IDC_OPEN_LOG, IDC_OPEN_PERF_REPORT, IDC_ROLLBACK_TEST, IDC_SHORTCUT}, ScaleForDpi(50, dpi));
 
         const int actionW = ScaleForDpi(104, dpi);
         const int actionH = ScaleForDpi(32, dpi);
@@ -1909,7 +2091,7 @@ void PaintWindow(HWND hwnd, HDC dc) {
     int pillX = hx;
     const int pillY = lm.header.top + ScaleForDpi(85, dpi);
     DrawPill(dc, pillX, pillY, g_coreReady ? L"已建置" : (g_developerMode ? L"尚未建置" : L"檔案不完整"), g_coreReady ? kGreen : kAmber, dpi);
-    DrawPill(dc, pillX, pillY, L"版本 " + Utf8ToWide(VRFK_VERSION_STRING), kAccent, dpi);
+    DrawPill(dc, pillX, pillY, Utf8ToWide(VRFK_DISPLAY_VERSION) + L" · " + Utf8ToWide(VRFK_TEST_BUILD_LABEL), kAccent, dpi);
     DrawPill(dc, pillX, pillY, g_developerMode ? L"開發版" : L"分享版", kCyan, dpi);
     if (g_developerMode) {
         DrawPill(dc, pillX, pillY, g_cmakeReady ? L"CMake OK" : L"CMake 未找到", g_cmakeReady ? kGreen : kRed, dpi);
@@ -1921,6 +2103,43 @@ void PaintWindow(HWND hwnd, HDC dc) {
 
     DrawSectionTitle(dc, L"啟動", lm.launchLabelY, hwnd);
     FillRounded(dc, lm.launchCard, ScaleForDpi(12, dpi), kPanel, RGB(34, 44, 59));
+
+    DrawSectionTitle(dc, L"即時效能監測", lm.perfLabelY, hwnd);
+    FillRounded(dc, lm.perfCard, ScaleForDpi(12, dpi), kPanel, RGB(34, 44, 59));
+    const int px = lm.perfCard.left + ScaleForDpi(18, dpi);
+    const int py = lm.perfCard.top + ScaleForDpi(12, dpi);
+    RECT statusRc{px, py, lm.perfCard.right - ScaleForDpi(18, dpi), py + ScaleForDpi(22, dpi)};
+    std::wstring perfStatus = g_coreRunning ? L"● 鍵盤執行中" : L"○ 鍵盤未執行";
+    if (g_coreRunning && !g_perfSnapshot.valid) perfStatus += L" · 等待第一筆資料…";
+    DrawTextSimple(dc, perfStatus, statusRc, g_font, g_coreRunning ? kGreen : kMuted, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+    if (g_perfSnapshot.valid) {
+        auto fmt = [](const wchar_t* label, float a, float b) {
+            wchar_t buf[160]{};
+            swprintf_s(buf, std::size(buf), L"%s %.3f / %.3f ms", label, a, b);
+            return std::wstring(buf);
+        };
+        wchar_t top[256]{};
+        swprintf_s(top, std::size(top), L"CPU %.2f%%    Loop %.0f/s    Total %.3f / %.3f ms    Submit Error %d",
+                   g_perfSnapshot.cpuPercent, g_perfSnapshot.loopsPerSec,
+                   g_perfSnapshot.avgTotalMs, g_perfSnapshot.maxTotalMs, g_perfSnapshot.submitError);
+        RECT topRc{px, py + ScaleForDpi(24, dpi), lm.perfCard.right - ScaleForDpi(18, dpi), py + ScaleForDpi(45, dpi)};
+        DrawTextSimple(dc, top, topRc, g_font, kText, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        const std::wstring left = fmt(L"Tracking", g_perfSnapshot.avgTrackingMs, g_perfSnapshot.maxTrackingMs) +
+                                  L"    " + fmt(L"Events", g_perfSnapshot.avgEventsMs, g_perfSnapshot.maxEventsMs) +
+                                  L"    " + fmt(L"Logic", g_perfSnapshot.avgLogicMs, g_perfSnapshot.maxLogicMs);
+        RECT leftRc{px, py + ScaleForDpi(47, dpi), lm.perfCard.right - ScaleForDpi(18, dpi), py + ScaleForDpi(67, dpi)};
+        DrawTextSimple(dc, left, leftRc, g_smallFont, kMuted, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        const std::wstring right = fmt(L"ImGui", g_perfSnapshot.avgImGuiMs, g_perfSnapshot.maxImGuiMs) +
+                                   L"    " + fmt(L"D3D", g_perfSnapshot.avgD3DMs, g_perfSnapshot.maxD3DMs) +
+                                   L"    " + fmt(L"Submit", g_perfSnapshot.avgSubmitMs, g_perfSnapshot.maxSubmitMs);
+        RECT rightRc{px, py + ScaleForDpi(68, dpi), lm.perfCard.right - ScaleForDpi(18, dpi), py + ScaleForDpi(88, dpi)};
+        DrawTextSimple(dc, right, rightRc, g_smallFont, kMuted, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    } else if (!g_coreRunning) {
+        RECT hintRc{px, py + ScaleForDpi(30, dpi), lm.perfCard.right - ScaleForDpi(18, dpi), py + ScaleForDpi(78, dpi)};
+        DrawTextSimple(dc, L"啟動 VR 鍵盤後，每 0.5 秒更新 CPU、主迴圈、Tracking、Events、Logic、ImGui、D3D、Submit 與 Total；同時自動寫入 CSV。",
+                       hintRc, g_smallFont, kMuted, DT_WORDBREAK | DT_LEFT | DT_VCENTER);
+    }
+
     if (g_developerMode) {
         DrawSectionTitle(dc, L"開發與發行", lm.devLabelY, hwnd);
         FillRounded(dc, lm.devCard, ScaleForDpi(12, dpi), kPanel, RGB(34, 44, 59));
@@ -1952,6 +2171,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_logExpanded = false;
 
         MakeButton(hwnd, IDC_RUN_VR);
+        MakeButton(hwnd, IDC_STOP_VR);
         MakeButton(hwnd, IDC_PREVIEW);
         MakeButton(hwnd, IDC_EDITOR);
         MakeButton(hwnd, IDC_UPDATE);
@@ -1966,6 +2186,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_developerMode) {
             MakeButton(hwnd, IDC_OPEN_ROOT);
             MakeButton(hwnd, IDC_OPEN_LOG);
+            MakeButton(hwnd, IDC_OPEN_PERF_REPORT);
             g_taskButtons.push_back(MakeButton(hwnd, IDC_ROLLBACK_TEST));
             MakeButton(hwnd, IDC_LOG_TOGGLE);
             MakeButton(hwnd, IDC_LOG_CLEAR);
@@ -1995,13 +2216,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RefreshStatus();
         Layout(hwnd);
         if (!g_developerMode) SetTimer(hwnd, TIMER_BACKGROUND_UPDATE, 1600, nullptr);
+        SetTimer(hwnd, TIMER_PERF_REFRESH, 500, nullptr);
         return 0;
     }
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
         const UINT dpi = WindowDpi(hwnd);
         info->ptMinTrackSize.x = ScaleForDpi(g_developerMode ? 900 : 820, dpi);
-        info->ptMinTrackSize.y = ScaleForDpi(g_developerMode ? 720 : 470, dpi);
+        info->ptMinTrackSize.y = ScaleForDpi(g_developerMode ? 830 : 590, dpi);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -2018,6 +2240,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == TIMER_BACKGROUND_UPDATE) {
             KillTimer(hwnd, TIMER_BACKGROUND_UPDATE);
             if (!g_developerMode) StartUpdateCheckTask(true);
+            return 0;
+        }
+        if (wParam == TIMER_PERF_REFRESH) {
+            RefreshPerfSnapshot();
             return 0;
         }
         break;
@@ -2054,6 +2280,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int id = LOWORD(wParam);
         switch (id) {
         case IDC_RUN_VR: LaunchCore(PendingLaunch::Vr); break;
+        case IDC_STOP_VR:
+            if (RequestCoreShutdown()) {
+                AppendLog(L"[測試] 已送出關閉鍵盤要求。\r\n");
+            } else {
+                MessageBoxW(hwnd, L"目前沒有可關閉的 VR Full Keyboard 測試程序。", L"關閉鍵盤", MB_ICONINFORMATION);
+            }
+            RefreshPerfSnapshot();
+            break;
         case IDC_PREVIEW: LaunchCore(PendingLaunch::Preview); break;
         case IDC_EDITOR: LaunchCore(PendingLaunch::Editor); break;
         case IDC_UPDATE: StartUpdateCheckTask(false); break;
@@ -2069,6 +2303,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_OPEN_OUTPUT: OpenOutput(); break;
         case IDC_OPEN_ROOT: OpenFolder(g_root); break;
         case IDC_OPEN_LOG: OpenBuildLog(); break;
+        case IDC_OPEN_PERF_REPORT: OpenPerfReport(); break;
         case IDC_ROLLBACK_TEST: StartRollbackSelfTest(); break;
         case IDC_SHORTCUT: {
             const bool ok = CreateDesktopShortcut();
@@ -2129,7 +2364,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (!info->updateAvailable) {
-            const std::wstring message = L"目前版本：" + Utf8ToWide(VRFK_VERSION_STRING) +
+            const std::wstring message = L"目前版本：" + Utf8ToWide(VRFK_DISPLAY_VERSION) +
                                          L"\nGitHub 最新版本：" + Utf8ToWide(info->tag) +
                                          L"\n\n目前已是最新版。";
             AppendLog(L"[更新] 已是最新版：" + Utf8ToWide(info->tag) + L"\r\n");
@@ -2151,7 +2386,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (notes.size() > 1400) notes = notes.substr(0, 1400) + L"\n...";
         if (g_developerMode) {
             std::wstring message = L"GitHub 有新版本：" + Utf8ToWide(info->tag) +
-                                   L"\n目前 Source 版本：" + Utf8ToWide(VRFK_VERSION_STRING) +
+                                   L"\n目前 Source 版本：" + Utf8ToWide(VRFK_DISPLAY_VERSION) +
                                    L"\n\n開發版不會用自動更新器覆蓋 Source 專案。\n要開啟 GitHub Release 嗎？";
             if (!notes.empty()) message += L"\n\n更新內容：\n" + notes;
             if (MessageBoxW(hwnd, message.c_str(), L"VR Full Keyboard 更新", MB_ICONINFORMATION | MB_YESNO) == IDYES && !info->pageUrl.empty()) {
@@ -2161,7 +2396,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         std::wstring message = L"發現新版本：" + Utf8ToWide(info->tag) + L"\n目前版本：" +
-                               Utf8ToWide(VRFK_VERSION_STRING);
+                               Utf8ToWide(VRFK_DISPLAY_VERSION);
         if (!notes.empty()) message += L"\n\n更新內容：\n" + notes;
         message += L"\n\n是：下載、驗證並安裝\n否：開啟 GitHub Release\n取消：稍後再說";
         const int choice = MessageBoxW(hwnd, message.c_str(), L"VR Full Keyboard 有新版本", MB_ICONINFORMATION | MB_YESNOCANCEL);
@@ -2291,7 +2526,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     RegisterClassExW(&releaseWc);
 
     const int initialWidth = g_developerMode ? 1120 : 980;
-    const int initialHeight = g_developerMode ? 760 : 500;
+    const int initialHeight = g_developerMode ? 900 : 630;
     g_hwnd = CreateWindowExW(0, cls, L"VR Full Keyboard 控制中心",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, initialWidth, initialHeight,

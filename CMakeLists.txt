@@ -11,6 +11,12 @@ if(NOT VRFK_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
     message(FATAL_ERROR "VERSION must contain MAJOR.MINOR.PATCH, got: ${VRFK_VERSION}")
 endif()
 
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/TEST_BUILD" VRFK_TEST_BUILD LIMIT_COUNT 1)
+string(STRIP "${VRFK_TEST_BUILD}" VRFK_TEST_BUILD)
+if(NOT VRFK_TEST_BUILD MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "TEST_BUILD must contain a numeric build identifier, got: ${VRFK_TEST_BUILD}")
+endif()
+
 project(VRFullKeyboard VERSION ${VRFK_VERSION} LANGUAGES CXX)
 
 # Official public update source. Keep these fixed so release builds can only

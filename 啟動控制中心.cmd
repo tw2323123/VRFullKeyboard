@@ -9,12 +9,15 @@ set "CONTROL_EXE=.frontend\VRFullKeyboardControl.exe"
 set "CONTROL_VERSION_FILE=.frontend\control_version.txt"
 set "PROJECT_VERSION="
 set /p PROJECT_VERSION=<VERSION
+set "PROJECT_TEST_BUILD="
+set /p PROJECT_TEST_BUILD=<TEST_BUILD
+set "PROJECT_BUILD_ID=%PROJECT_VERSION%-TB%PROJECT_TEST_BUILD%"
 
-rem Daily launches do not rebuild the Control Center when the version matches.
+rem Daily launches do not rebuild the Control Center when SemVer + Test Build match.
 if exist "%CONTROL_EXE%" if exist "%CONTROL_VERSION_FILE%" (
     set "BUILT_VERSION="
     set /p BUILT_VERSION=<"%CONTROL_VERSION_FILE%"
-    if "%BUILT_VERSION%"=="%PROJECT_VERSION%" (
+    if "%BUILT_VERSION%"=="%PROJECT_BUILD_ID%" (
         start "" "%CONTROL_EXE%"
         exit /b 0
     )
@@ -23,6 +26,7 @@ if exist "%CONTROL_EXE%" if exist "%CONTROL_VERSION_FILE%" (
 > "%BOOT_LOG%" echo VR Full Keyboard Control Center bootstrap build log
 >>"%BOOT_LOG%" echo Date: %date% %time%
 >>"%BOOT_LOG%" echo Version: %PROJECT_VERSION%
+>>"%BOOT_LOG%" echo Test build: %PROJECT_TEST_BUILD%
 >>"%BOOT_LOG%" echo.
 
 set "CMAKE_EXE="
@@ -56,7 +60,7 @@ if errorlevel 1 goto :fail
 if errorlevel 1 goto :fail
 
 copy /y ".frontend\build-control\Release\VRFullKeyboardControl.exe" "%CONTROL_EXE%" >nul
-> "%CONTROL_VERSION_FILE%" echo %PROJECT_VERSION%
+> "%CONTROL_VERSION_FILE%" echo %PROJECT_BUILD_ID%
 rmdir /s /q ".frontend\build-control" >nul 2>nul
 attrib +h ".frontend" >nul 2>nul
 

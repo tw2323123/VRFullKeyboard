@@ -1,0 +1,32 @@
+Alpha V3.9.10 / Test Build 03 — Knuckles Grip VALIDATED
+
+已通過的 SteamVR 基準（Valve Index / Knuckles）：
+1. Windows/MSVC Release 建置成功。
+2. 鍵盤初始尺寸、距離、高度、角度自然。
+3. 曲面顯示與左右邊緣瞄準正常。
+4. Pointer 命中與按鍵發光瞬間同步，未再觀察到「晚一拍」。
+5. 一般模式可直接抓取鍵盤，放手後固定在新位置。
+6. 手腕圓點可由另一手 Grip 重新調位，並保存 wrist-local offset。
+7. Backspace、Delete、方向鍵單擊只觸發一次；PageUp/PageDown 保留長按連發。
+8. SteamVR Dashboard 可正常點擊，不受 VRFullKeyboard 搶輸入。
+
+Knuckles 抓取手勢：
+- 先張開抓握手指離開 Grip 感測區。
+- 再握回並穩定接觸約 70ms → 開始抓取。
+- 再次張開離開感測區約 100ms → 放開。
+
+後續回歸測試原則：
+1. 任何 Grip / Pointer / Trigger 修改後，都要先重測 SteamVR Dashboard 是否仍可正常操作。
+2. 不要在 TB03 基準重新引入 SteamVR Action Manifest 或 binding JSON。
+3. 保持阻尼 0、自適應材質更新關閉作為低延遲基準。
+4. 其他控制器（Quest / Touch、Vive、WMR、Pico）必須各自實機驗證 Grip 映射，不能直接套用 Knuckles 結論。
+5. 若再次出現「晚一拍」，優先檢查 Pointer 命中/高亮時序，不要先改 frame pacing。
+
+
+TEST12 新增實測：
+1. 將圓點校正到手背：手背朝向視線時顯示；翻離視線時立刻隱藏；翻回後重新顯示。
+2. 用另一手 Grip 拖曳圓點時，即使跨過顯示角度邊界也不可在拖曳途中消失。
+3. 開啟 SteamVR Dashboard：Dashboard 原有按鈕仍須可正常點擊。
+4. Dashboard 保持開啟時，指向手腕圓點並按 Trigger，必須可叫出／展開鍵盤。
+5. 關閉 Dashboard 後回 VRChat/場景，再點圓點一次，確認已回到 VALIDATED 的手動輸入路徑。
+6. 最後重測一般模式 Knuckles Grip：release -> arm -> touch -> grab，放手後位置固定。
